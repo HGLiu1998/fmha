@@ -1,32 +1,10 @@
-/*
- * Flash Multi-Head Attention (FMHA) Kernel for AMD GPUs
- *
- * This implementation provides a memory-efficient attention mechanism using the
- * Flash Attention algorithm with online softmax computation.
- *
- * Key Features:
- * - Mixed precision: bf16 inputs (Q, K, V) and fp16 output (O)
- * - Online softmax: Computes softmax without materializing full attention matrix
- * - Grouped Query Attention (GQA): Supports different number of Q and KV heads
- * - Memory layout: BHSD (Batch, Heads, Sequence, Dimension)
- *
- * Algorithm Overview:
- * 1. For each query position, iterate through all key positions
- * 2. Compute attention scores (Q·K^T) scaled by 1/√d
- * 3. Apply online softmax to maintain numerical stability
- * 4. Accumulate weighted V values to produce output
- *
- * Target Hardware: AMD MI100 (gfx908), MI210/MI250 (gfx90a), MI300 (gfx942)
- */
-
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_bfloat16.h>
 #include <stdio.h>
 #include <math.h>
 
 // Type alias for bfloat16
 using bhalf_t = __bf16;
+using half_t  = _Float16;
 
 // Flash Attention kernel configuration
 #define WARP_SIZE 64        // AMD GPU warp size (64 threads per wavefront)
@@ -241,98 +219,3 @@ __global__ void fmha_forward_kernel(
         O[o_offset + d] = __float2half(acc[d] * inv_sum);
     }
 }  // End of fmha_forward_kernel
-
-// ============================================================================
-// Host Launcher Function
-// ============================================================================
-
-/**
- * Launch Flash Multi-Head Attention kernel from host code
- *
- * This function configures and launches the FMHA kernel with appropriate
- * grid and block dimensions for the given tensor sizes.
- *
- * Grid Configuration:
- * - X dimension: Covers query sequence length (seqlen_q / BLOCK_SIZE blocks)
- * - Y dimension: One block per query head (num_heads_q blocks)
- * - Z dimension: One block per batch element (batch blocks)
- * - Total blocks: ⌈seqlen_q/256⌉ × num_heads_q × batch
- *
- * Block Configuration:
- * - BLOCK_SIZE (256) threads per block
- * - Each thread processes one query position
- *
- * Mixed Precision:
- * - Input tensors (Q, K, V): bfloat16 for better training stability
- * - Output tensor (O): float16 for memory efficiency
- * - Internal computation: float32 for numerical accuracy
- *
- * @param d_Q Device pointer to Query tensor (bf16)
- * @param d_K Device pointer to Key tensor (bf16)
- * @param d_V Device pointer to Value tensor (bf16)
- * @param d_O Device pointer to Output tensor (fp16)
- * @param batch Batch size
- * @param num_heads_q Number of query heads
- * @param num_heads_kv Number of key/value heads (for GQA)
- * @param seqlen_q Query sequence length
- * @param seqlen_kv Key/value sequence length
- * @param head_dim_q Query head dimension
- * @param head_dim_kv Key/value head dimension
- * @param stream HIP stream for asynchronous execution
- */
-extern "C" void launch_fmha_forward(
-    const bhalf_t* d_Q,
-    const bhalf_t* d_K,
-    const bhalf_t* d_V,
-    half* d_O,
-    const int batch,
-    const int num_heads_q,
-    const int num_heads_kv,
-    const int seqlen_q,
-    const int seqlen_kv,
-    const int head_dim_q,
-    const int head_dim_kv,
-    hipStream_t stream
-) {
-    // ========================================================================
-    // Compute Softmax Scaling Factor
-    // ========================================================================
-    // Standard scaled dot-product attention uses 1/√d scaling to prevent
-    // gradients from vanishing when d is large. This keeps the variance of
-    // Q·K^T at a reasonable scale before softmax.
-    //
-    // Without scaling: Q·K^T has variance proportional to d
-    // With scaling: Q·K^T / √d has variance approximately 1
-    const float softmax_scale = 1.0f / sqrtf((float)head_dim_q);
-
-    // ========================================================================
-    // Configure Kernel Launch Parameters
-    // ========================================================================
-    // Block: 1D array of BLOCK_SIZE threads
-    dim3 block(BLOCK_SIZE);
-
-    // Grid: 3D array of blocks covering all (batch, head, sequence) positions
-    dim3 grid(
-        (seqlen_q + BLOCK_SIZE - 1) / BLOCK_SIZE,  // X: query sequence (with ceiling division)
-        num_heads_q,                                // Y: query heads
-        batch                                       // Z: batch elements
-    );
-
-    // ========================================================================
-    // Launch Kernel
-    // ========================================================================
-    // hipLaunchKernelGGL: HIP macro for launching kernels
-    // Parameters: kernel_function, grid_dim, block_dim, shared_mem_bytes, stream, kernel_args...
-    hipLaunchKernelGGL(
-        fmha_forward_kernel,
-        grid, block,
-        0,          // Shared memory bytes (not used in this kernel)
-        stream,     // HIP stream for async execution
-        // Kernel arguments:
-        d_Q, d_K, d_V, d_O,
-        batch, num_heads_q, num_heads_kv,
-        seqlen_q, seqlen_kv,
-        head_dim_q, head_dim_kv,
-        softmax_scale
-    );
-}  // End of launch_fmha_forward

@@ -1,95 +1,27 @@
-/*
- * Flash Multi-Head Attention (FMHA) Host Code and Benchmark
- *
- * This file contains:
- * - Host-side memory management and data initialization
- * - Benchmark harness for performance measurement
- * - Test configurations for various attention scenarios
- *
- * The implementation benchmarks Flash Attention on AMD GPUs with:
- * - Mixed precision: bf16 inputs (Q, K, V) and fp16 output (O)
- * - Multiple head dimensions: 128 and 256
- * - Various head counts: 16 and 32 heads
- * - Grouped Query Attention (GQA) support
- *
- * Target Hardware: AMD MI100 (gfx908), MI210/MI250 (gfx90a), MI300 (gfx942)
- */
-
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_bfloat16.h>
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <random>
 #include <chrono>
+#include "fmha_kernel.hpp"
 
 // Type alias for bfloat16 (must match kernel definition)
 using bhalf_t = __bf16;
+using half_t  = _Float16;
 
-// ============================================================================
-// Kernel Launch Function Declaration
-// ============================================================================
-/**
- * External kernel launcher from fmha_kernel.hpp
- * See fmha_kernel.hpp for detailed documentation
- */
-extern "C" void launch_fmha_forward(
-    const bhalf_t* d_Q,
-    const bhalf_t* d_K,
-    const bhalf_t* d_V,
-    half* d_O,
-    const int batch,
-    const int num_heads_q,
-    const int num_heads_kv,
-    const int seqlen_q,
-    const int seqlen_kv,
-    const int head_dim_q,
-    const int head_dim_kv,
-    hipStream_t stream
-);
+#define CEIL_DIV(a, b) (a + b - 1) / b
+#define HIP_CHECK_ERROR(cmd)                \
+    do {                                    \
+        hipError_t status = cmd;            \
+        if (status != hipSuccess) {         \
+            std::ostringstream ostr;                                                    \
+            ostr << "HIP Function Failed (" << __FILE__ << "," << __LINE__ <<") "       \
+                 << hipGetErrorString(status);                                          \
+            throw std::runtime_error(ostr.str());                                       \
+        }                                                                               \
+    } while(0)                              \
 
-// ============================================================================
-// Error Checking Macro
-// ============================================================================
-/**
- * HIP_CHECK: Wrapper macro for HIP API calls
- *
- * Checks the return value of HIP API calls and prints an error message
- * before exiting if the call failed. This simplifies error handling and
- * makes HIP code more readable.
- *
- * Usage: HIP_CHECK(hipMalloc(&ptr, size));
- */
-#define HIP_CHECK(call) \
-    do { \
-        hipError_t err = call; \
-        if (err != hipSuccess) { \
-            std::cerr << "HIP Error: " << hipGetErrorString(err) \
-                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-            exit(EXIT_FAILURE); \
-        } \
-    } while(0)
-
-// ============================================================================
-// FMHA Configuration Class
-// ============================================================================
-/**
- * FMHAConfig: Encapsulates all parameters for a Flash Attention configuration
- *
- * This class stores tensor dimensions and provides helper methods to compute
- * tensor sizes. It supports both standard Multi-Head Attention (MHA) and
- * Grouped Query Attention (GQA).
- *
- * Tensor Layout: BHSD (Batch, Heads, Sequence, Dimension)
- * - Q: [batch, num_heads_q, seqlen_q, head_dim_q]
- * - K: [batch, num_heads_kv, seqlen_kv, head_dim_kv]
- * - V: [batch, num_heads_kv, seqlen_kv, head_dim_kv]
- * - O: [batch, num_heads_q, seqlen_q, head_dim_q]
- *
- * For standard MHA: num_heads_q == num_heads_kv
- * For GQA: num_heads_q > num_heads_kv (multiple Q heads share KV heads)
- */
 class FMHAConfig {
 public:
     int batch;          // Batch size (number of independent sequences)
@@ -107,23 +39,8 @@ public:
         : batch(b), num_heads_q(nhq), num_heads_kv(nhkv),
           seqlen_q(sq), seqlen_kv(skv), head_dim_q(hdq), head_dim_kv(hdkv) {}
 
-    /**
-     * Calculate total number of elements in Q tensor
-     * Q shape: [batch, num_heads_q, seqlen_q, head_dim_q]
-     */
     size_t q_size() const { return batch * num_heads_q * seqlen_q * head_dim_q; }
-
-    /**
-     * Calculate total number of elements in K or V tensor
-     * K/V shape: [batch, num_heads_kv, seqlen_kv, head_dim_kv]
-     */
     size_t kv_size() const { return batch * num_heads_kv * seqlen_kv * head_dim_kv; }
-
-    /**
-     * Calculate total number of elements in O tensor
-     * O shape: [batch, num_heads_q, seqlen_q, head_dim_q]
-     * Note: O has same shape as Q
-     */
     size_t o_size() const { return batch * num_heads_q * seqlen_q * head_dim_q; }
 
     /**
@@ -168,100 +85,73 @@ void initialize_random_half(std::vector<half>& vec) {
     }
 }
 
-/**
- * Initialize a bfloat16 (bf16) vector with random values
- *
- * Fills the vector with uniformly distributed random values in [-1.0, 1.0].
- * Used for initializing Q, K, V tensors in mixed precision mode.
- *
- * @param vec Reference to std::vector<bhalf_t> to be initialized
- */
-void initialize_random_bfloat16(std::vector<bhalf_t>& vec) {
+void initialize_random_bfloat16(bhalf_t* mat, int N) {
     std::random_device rd;                          // Obtain random seed
     std::mt19937 gen(rd());                         // Mersenne Twister RNG
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);  // Uniform in [-1, 1]
 
-    for (size_t i = 0; i < vec.size(); i++) {
-        vec[i] = __float2bfloat16(dis(gen));        // Convert fp32 -> bf16
+    for (size_t i = 0; i < N; i++) {
+        mat[i] = static_cast<bhalf_t>(dis(gen));        // Convert fp32 -> bf16
     }
 }
 
-// ============================================================================
-// FMHA Benchmark Runner
-// ============================================================================
-/**
- * Run FMHA benchmark for a given configuration
- *
- * This function performs the following steps:
- * 1. Allocate and initialize host (CPU) memory for Q, K, V, O tensors
- * 2. Allocate device (GPU) memory
- * 3. Copy input data from host to device
- * 4. Run warm-up iteration to initialize GPU caches
- * 5. Run timed iterations to measure performance
- * 6. Compute and display performance metrics (time, throughput, TFLOPS)
- * 7. Copy results back and clean up
- *
- * Memory Management:
- * - Host memory: std::vector for automatic cleanup
- * - Device memory: Explicit hipMalloc/hipFree
- * - All HIP calls wrapped with HIP_CHECK for error handling
- *
- * Performance Metrics:
- * - Average time per iteration (milliseconds)
- * - Throughput (iterations per second)
- * - Estimated TFLOPS (tera floating-point operations per second)
- *
- * @param config FMHA configuration (dimensions, head counts, etc.)
- * @param num_iterations Number of benchmark iterations (default: 100)
- */
 void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 100) {
     std::cout << "\n=== Running FMHA Benchmark ===\n";
     config.print();
 
+    hipEvent_t start, end;
     // ========================================================================
     // Step 1: Allocate Host Memory
     // ========================================================================
     // Using std::vector for automatic memory management and exception safety
     // Q, K, V use bf16 (2 bytes per element)
     // O uses fp16 (2 bytes per element)
-    std::vector<bhalf_t> h_Q(config.q_size());
-    std::vector<bhalf_t> h_K(config.kv_size());
-    std::vector<bhalf_t> h_V(config.kv_size());
-    std::vector<half> h_O(config.o_size());
+    bhalf_t *h_Q, *h_K, *h_V;
+    half_t *h_O;
+
+    h_Q = (bhalf_t*)malloc(config.q_size() * sizeof(bhalf_t));
+    h_K = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
+    h_V = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
+    h_O = (half_t*)malloc(config.o_size() * sizeof(half_t));
 
     // ========================================================================
     // Step 2: Initialize Input Tensors with Random Data
     // ========================================================================
     std::cout << "\nInitializing tensors...\n";
-    initialize_random_bfloat16(h_Q);  // Random values in [-1, 1]
-    initialize_random_bfloat16(h_K);
-    initialize_random_bfloat16(h_V);
+    initialize_random_bfloat16(h_Q, config.q_size());  // Random values in [-1, 1]
+    initialize_random_bfloat16(h_K, config.kv_size());
+    initialize_random_bfloat16(h_V, config.kv_size());
 
     // ========================================================================
     // Step 3: Allocate Device (GPU) Memory
     // ========================================================================
     bhalf_t *d_Q, *d_K, *d_V;  // Device pointers for bf16 input tensors
-    half *d_O;                  // Device pointer for fp16 output tensor
+    half_t *d_O;                  // Device pointer for fp16 output tensor
 
-    HIP_CHECK(hipMalloc(&d_Q, config.q_size() * sizeof(bhalf_t)));
-    HIP_CHECK(hipMalloc(&d_K, config.kv_size() * sizeof(bhalf_t)));
-    HIP_CHECK(hipMalloc(&d_V, config.kv_size() * sizeof(bhalf_t)));
-    HIP_CHECK(hipMalloc(&d_O, config.o_size() * sizeof(half)));
+    HIP_CHECK(hipMalloc((void**)&d_Q, config.q_size() * sizeof(bhalf_t)));
+    HIP_CHECK(hipMalloc((void**)&d_K, config.kv_size() * sizeof(bhalf_t)));
+    HIP_CHECK(hipMalloc((void**)&d_V, config.kv_size() * sizeof(bhalf_t)));
+    HIP_CHECK(hipMalloc((void**)&d_O, config.o_size() * sizeof(half_t)));
+    //HIP_CHECK(hipMalloc(&d_O, config.o_size() * sizeof(half)));
 
     // ========================================================================
     // Step 4: Copy Input Data from Host to Device
     // ========================================================================
-    std::cout << "Copying data to device...\n";
+    std::cout << "Preparing data on GPU...\n";
+    HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
     HIP_CHECK(hipMemcpy(d_Q, h_Q.data(), config.q_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_K, h_K.data(), config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_V, h_V.data(), config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
 
+    dim3 gridDim(CEIL_DIV(config.seqlen_q, 256), config.num_heads_q, config.batch);
+    dim3 blockDim(256, 1, 1);
     // ========================================================================
     // Step 5: Create HIP Stream for Asynchronous Execution
     // ========================================================================
     // HIP streams allow kernels to execute asynchronously with respect to the host
     hipStream_t stream;
     HIP_CHECK(hipStreamCreate(&stream));
+    hipEvent_t start, end;
 
     // ========================================================================
     // Step 6: Warm-up Run
@@ -345,32 +235,14 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 100) {
     // std::vectors go out of scope
 }  // End of run_fmha_benchmark
 
-// ============================================================================
-// Main Function: Benchmark Driver
-// ============================================================================
-/**
- * Main entry point for FMHA benchmark
- *
- * Workflow:
- * 1. Detect and display HIP device information
- * 2. Define test configurations covering common use cases
- * 3. Run benchmarks for each configuration
- * 4. Display aggregate results
- *
- * Test Configurations:
- * The benchmarks use specific configurations from the project requirements:
- * - Large batch size (30720) for throughput testing
- * - Short sequences (seqlen_q=1, seqlen_kv=2) typical of inference scenarios
- * - Common head dimensions (128, 256)
- * - Varying head counts (16, 32) to test scalability
- *
- * All configurations use standard MHA (num_heads_q == num_heads_kv)
- * For GQA testing, modify configs to have num_heads_q > num_heads_kv
- */
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
     std::cout << "Flash Multi-Head Attention (FMHA) HIP Implementation\n";
     std::cout << "====================================================\n\n";
 
+    int config_index;
+    if (argc >= 2) {
+        config_index = atoi(argv[1]);
+    }
     // ========================================================================
     // Device Detection and Information
     // ========================================================================
@@ -391,7 +263,6 @@ int main(int argc, char** argv) {
     std::cout << "Using device: " << prop.name << "\n";
     std::cout << "Compute capability: " << prop.major << "." << prop.minor << "\n";
     std::cout << "Total memory: " << prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0) << " GB\n\n";
-
     // ========================================================================
     // Define Test Configurations
     // ========================================================================
@@ -417,12 +288,7 @@ int main(int argc, char** argv) {
     // ========================================================================
     // Run Benchmarks
     // ========================================================================
-    for (size_t i = 0; i < configs.size(); i++) {
-        std::cout << "\n\n========================================\n";
-        std::cout << "Configuration " << (i + 1) << " of " << configs.size() << "\n";
-        std::cout << "========================================\n";
-        run_fmha_benchmark(configs[i], 100);  // 100 iterations per config
-    }
+    run_fmha_benchmark(configs[config_index], 100);
 
     // ========================================================================
     // Completion
