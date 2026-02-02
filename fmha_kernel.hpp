@@ -43,11 +43,13 @@ void fmha_forward_kernel(
     const int headIdx = laneIdx / 4; //[0-15];
     const int laneInHead = laneIdx % 4; //[0-3];
 
+    /**
     Q += headIdx * seqlen_q * head_dim_q;
     // Need to handle K transpose or not
-    K += headIdx * seqlen_kv; 
+    K += headIdx * seqlen_kv * head_dim_kv; 
     V += headIdx * seqlen_kv * head_dim_kv;
     O += headIdx * seqlen_q * head_dim_q;
+    **/
 
     const int kv_head_idx = (head_idx * num_heads_kv) / num_heads_q;
     const int M_iter = CEIL_DIV(seqlen_kv, 4); // seqlen_k might be 1 to 16.
@@ -58,41 +60,53 @@ void fmha_forward_kernel(
     // scores will be 16/32 * 1 * [1 - 16] * 4B = 64B to 2KB.
     // 256 threads load seqlen_q * head_dim_q * num_of_heads 
     __shared__ __attribute__((aligned(128))) bhalf_t Qs[num_heads_q * seqlen_q * (head_dim_q + 4)];
-    __shared__ __attribute__((aligned(128))) bhalf_t Ks[num_heads_kv * 4 * (head_dim_kv + 4)]; // V reuse it?
-    __shared__ __attribute__((aligned(128))) float scores[num_heads_kv * seqlqn_q * seqlen_kv];
+    __shared__ __attribute__((aligned(128))) bhalf_t Ks[num_heads_kv * 4 * (head_dim_kv + 4)]; // tile size 4
+    __shared__ __attribute__((aligned(128))) float scores[num_heads_kv * seqlen_q * seqlen_kv];
 
     const int total_q_elems = head_dim_q * seqlen_q * num_heads_q;
-    const int total_k_elems = head_dim_kv * seqlen_kv * num_heads_kv;
+    constexpr int vec_size = 4;
     constexpr int elems_q_per_thread = total_q_elems / 256;
-    constexpr int elems_k_per_thread = total_k_elems / 256;
-    constexpr int vec_size = 4; // one thread need 4 elements to do instructions.
     constexpr int vec_q_per_thread = CEIL_DIV(elems_q_per_thread, vec_size);
-    constexpr int vec_k_per_thread = CEIL_DIV(elems_k_per_thread, vec_size);
 
-    
+    // K load: per-head, per-tile so each head's data is loaded with correct global/LDS mapping.
+    // Tile = 4 rows; last tile has rows_this_tile = min(4, seqlen_kv - 4*m) when seqlen_kv % 4 != 0.
+    const int vecs_per_head_row = head_dim_kv / vec_size;  // vectors per row (same head)
+
     if (warpIdx == 0) {
         #pragma unroll
         for (int i = 0; i < vec_q_per_thread; ++ i) {
             int flat_idx = (tid * vec_q_per_thread + i) * vec_size;
-
-            int h = flat_idx / (head_dim_q * seqlen_q);
+            int h = flat_idx / head_dim_q;
             int d = flat_idx % head_dim_q;
-
             int qLDSOffset = h * (head_dim_q + 4) * seqlen_q + d;
             int qGlobalOffset = h * head_dim_q * seqlen_q + d;
-
             *(bf16x4*)(&Qs[qLDSOffset]) = Q[qGlobalOffset];
         }
-        
-        for (int i = 0; i < M_iter; ++i) {
-            #pragma unroll
-            for (int i = 0; i < vec_k_per_thread; ++ i) {
-                int flat_idx = (tid * vec_k_per_thread + i) * vec_size;
-                int h - flat_idx / (4 * 128);
-                
+
+        for (int m = 0; m < M_iter; ++m) {
+            const int row_start = 4 * m;
+            const int rows_this_tile = (seqlen_kv - row_start < 4) ? (seqlen_kv - row_start) : 4;  // 1..4, handles seqlen_kv % 4 != 0
+            const int vecs_this_tile = num_heads_kv * rows_this_tile * vecs_per_head_row;
+            const int vecs_per_thread_k = CEIL_DIV(vecs_this_tile, 256);
+
+            for (int i = 0; i < vecs_per_thread_k; ++i) {
+                int vec_idx = tid * vecs_per_thread_k + i;
+                if (vec_idx >= vecs_this_tile)
+                    continue;
+                // Decode: vec_idx = h * (rows_this_tile * vecs_per_head_row) + s_local * vecs_per_head_row + d4/4
+                int vec_in_head_tile = vec_idx % (rows_this_tile * vecs_per_head_row);
+                int h = vec_idx / (rows_this_tile * vecs_per_head_row);
+                int s_local = vec_in_head_tile / vecs_per_head_row;
+                int d4 = (vec_in_head_tile % vecs_per_head_row) * vec_size;
+                int s_global = row_start + s_local;
+
+                int kGlobalOffset = h * seqlen_kv * head_dim_kv + s_global * head_dim_kv + d4;
+                int kLDSOffset = h * 4 * (head_dim_kv + 4) + s_local * (head_dim_kv + 4) + d4;
+
+                // Always 4 consecutive elements in the same row; padding rows (s_local >= rows_this_tile) not accessed here
+                *(bf16x4*)(&Ks[kLDSOffset]) = K[kGlobalOffset];
             }
         }
-    
     }
 
     
