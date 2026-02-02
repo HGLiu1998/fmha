@@ -85,8 +85,8 @@ void fmha_forward_kernel(
 
         // Dot product (bf16 -> fp32)
         for (int d = 0; d < head_dim_q; d++) {
-            float q_val = __bfloat162float(Q[q_offset + d]);
-            float k_val = __bfloat162float(K[k_offset + d]);
+            float q_val = static_cast<float>(Q[q_offset + d]);
+            float k_val = static_cast<float>(K[k_offset + d]);
             score += q_val * k_val;
         }
         score *= softmax_scale;  // Scale by 1/√d
@@ -107,7 +107,7 @@ void fmha_forward_kernel(
                             kv_idx * head_dim_kv;
 
         for (int d = 0; d < head_dim_q; d++) {
-            float v_val = __bfloat162float(V[v_offset + d]);
+            float v_val = static_cast<float>(V[v_offset + d]);
             acc[d] = acc[d] * scale + exp_score * v_val;
         }
     }
@@ -122,6 +122,6 @@ void fmha_forward_kernel(
 
     // Write output (fp32 -> fp16)
     for (int d = 0; d < head_dim_q; d++) {
-        O[o_offset + d] = __float2half(acc[d] * inv_sum);
+        O[o_offset + d] = static_cast<half_t>(acc[d] * inv_sum);
     }
 }

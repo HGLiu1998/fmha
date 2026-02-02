@@ -69,7 +69,7 @@ public:
                   << "  Q tensor size: " << q_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
                   << "  K tensor size: " << kv_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
                   << "  V tensor size: " << kv_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
-                  << "  O tensor size: " << o_size() * sizeof(half) / (1024.0 * 1024.0) << " MB (fp16)\n";
+                  << "  O tensor size: " << o_size() * sizeof(half_t) / (1024.0 * 1024.0) << " MB (fp16)\n";
     }
 };
 
@@ -78,13 +78,13 @@ public:
 // ============================================================================
 
 /** Initialize fp16 vector with random uniform values in [-1, 1] */
-void initialize_random_half(std::vector<half>& vec) {
+void initialize_random_half(std::vector<half_t>& vec) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
     for (size_t i = 0; i < vec.size(); i++) {
-        vec[i] = __float2half(dis(gen));
+        vec[i] = static_cast<half_t>(dis(gen));
     }
 }
 
