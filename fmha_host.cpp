@@ -144,7 +144,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 100, int 
     HIP_CHECK(hipMemcpy(d_V, h_V, config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
 
     // Configure kernel launch parameters
-    dim3 gridDim(CEIL_DIV(config.seqlen_q * config.num_heads_q, 256), 1, config.batch);
+    dim3 gridDim(CEIL_DIV(config.seqlen_q * config.num_heads_q * config.head_dim_q, 256), 1, config.batch); //(1, 1, batch)
     dim3 blockDim(256, 1, 1);
 
     // Create HIP events for timing
