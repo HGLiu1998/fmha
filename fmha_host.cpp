@@ -144,7 +144,8 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 100, int 
     HIP_CHECK(hipMemcpy(d_V, h_V, config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
 
     // Configure kernel launch parameters
-    dim3 gridDim(CEIL_DIV(config.seqlen_q * config.num_heads_q * config.head_dim_q, 256), 1, config.batch); //(1, 1, batch)
+    // Grid: (1, num_heads, batch) - Each block handles one head
+    dim3 gridDim(1, config.num_heads_q, config.batch);
     dim3 blockDim(256, 1, 1);
 
     // Create HIP events for timing
@@ -234,8 +235,8 @@ int main(int argc, char* argv[]) {
     int config_index = -1;  // -1 means run all configs
     if (argc >= 2) {
         config_index = atoi(argv[1]);
-        if (config_index < 0 || config_index > 3) {
-            std::cerr << "Error: config_index must be 0-3\n";
+        if (config_index < 0 || config_index > 17) {
+            std::cerr << "Error: config_index must be 0-17\n";
             std::cerr << "Usage: " << argv[0] << " [config_index]\n";
             return EXIT_FAILURE;
         }
@@ -260,10 +261,31 @@ int main(int argc, char* argv[]) {
     // Define test configurations
     // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, seqlen_kv, head_dim_q, head_dim_kv)
     std::vector<FMHAConfig> configs = {
-        FMHAConfig(30720, 16, 16, 1, 2, 256, 256),  // Config 0: 16h × 256d
-        FMHAConfig(30720, 16, 16, 1, 2, 128, 128),  // Config 1: 16h × 128d
-        FMHAConfig(30720, 32, 32, 1, 2, 256, 256),  // Config 2: 32h × 256d
-        FMHAConfig(30720, 32, 32, 1, 2, 128, 128),  // Config 3: 32h × 128d
+        // Test various seqlen_kv values (1-16) with 16 heads, head_dim=128
+        FMHAConfig(30720, 16, 16, 1, 1, 128, 128),   // Config 0
+        FMHAConfig(30720, 16, 16, 1, 2, 128, 128),   // Config 1
+        FMHAConfig(30720, 16, 16, 1, 4, 128, 128),   // Config 2
+        FMHAConfig(30720, 16, 16, 1, 8, 128, 128),   // Config 3
+        FMHAConfig(30720, 16, 16, 1, 16, 128, 128),  // Config 4
+        
+        // Test various seqlen_kv values with 16 heads, head_dim=256
+        FMHAConfig(30720, 16, 16, 1, 1, 256, 256),   // Config 5
+        FMHAConfig(30720, 16, 16, 1, 2, 256, 256),   // Config 6
+        FMHAConfig(30720, 16, 16, 1, 4, 256, 256),   // Config 7
+        FMHAConfig(30720, 16, 16, 1, 8, 256, 256),   // Config 8
+        FMHAConfig(30720, 16, 16, 1, 16, 256, 256),  // Config 9
+        
+        // Test 32 heads with various seqlen_kv, head_dim=128
+        FMHAConfig(30720, 32, 32, 1, 1, 128, 128),   // Config 10
+        FMHAConfig(30720, 32, 32, 1, 2, 128, 128),   // Config 11
+        FMHAConfig(30720, 32, 32, 1, 8, 128, 128),   // Config 12
+        FMHAConfig(30720, 32, 32, 1, 16, 128, 128),  // Config 13
+        
+        // Test 32 heads with various seqlen_kv, head_dim=256
+        FMHAConfig(30720, 32, 32, 1, 1, 256, 256),   // Config 14
+        FMHAConfig(30720, 32, 32, 1, 2, 256, 256),   // Config 15
+        FMHAConfig(30720, 32, 32, 1, 8, 256, 256),   // Config 16
+        FMHAConfig(30720, 32, 32, 1, 16, 256, 256),  // Config 17
     };
 
     // Run benchmark(s)
