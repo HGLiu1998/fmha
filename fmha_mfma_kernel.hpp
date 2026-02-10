@@ -60,10 +60,6 @@ void fmha_mfma(
     const uint mem = seqlen_kv * seqlen_q;
     __shared__ __attribute__((aligned(128))) float scores[260];
 
-    if (tid == 0) {
-        printf("%f", scores[0]);
-    }
-
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
     for (int k = 0; k < head_dim_q; k += BK) {
@@ -89,7 +85,7 @@ void fmha_mfma(
     for (int i = 0; i < 4; ++i) {
         const uint row = i / 4;
         int idx = (lane_row * 4 + row) * 16 + lane_col;
-        scores[idx] = acc[i];
+        scores[idx] += acc[i];
     }
 
     __syncthreads();
