@@ -72,14 +72,14 @@ void fmha_mfma(
         if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
+        __syncthreads();
 
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        if (tid == 0) {
-            printf("%f, %f, %f, %f\n", (float)(a[0]), (float)(a[1]), (float)(a[2]), (float)(a[3]));
-            printf("%f, %f, %f, %f\n", (float)(b[0]), (float)(b[1]), (float)(b[2]), (float)(b[3]));
-            printf("%f, %f, %f, %f\n", (float)(acc[0]), (float)(acc[1]), (float)(acc[2]), (float)(acc[3]));
+        if (tid == 0 || tid == 1 || tid == 16) {
+            printf("%d, %f, %f, %f, %f\n", tid, (float)(a[0]), (float)(a[1]), (float)(a[2]), (float)(a[3]));
+            printf("%d, %f, %f, %f, %f\n", tid, (float)(b[0]), (float)(b[1]), (float)(b[2]), (float)(b[3]));
+            printf("%d, %f, %f, %f, %f\n", tid, (float)(acc[0]), (float)(acc[1]), (float)(acc[2]), (float)(acc[3]));
         }
-        __syncthreads();
     }
 
     for (int i = 0; i < 4; ++i) {
