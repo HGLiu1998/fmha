@@ -72,8 +72,11 @@ void fmha_mfma(
         if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
-        
-        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+        if (tid == 0) {
+            printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
+            printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
+        }
+        acc = __builtin_amdgcn_mfma_f32_16x16x16_bf16(a, b, acc, 0, 0, 0);
     }
 
     for (int i = 0; i < 4; ++i) {
@@ -83,6 +86,7 @@ void fmha_mfma(
     }
 
     if (tid == 0) {
+
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("%f ", scores[i]);
         }
