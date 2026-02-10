@@ -89,7 +89,7 @@ void fmha_mfma(
     for (int i = 0; i < 4; ++i) {
         const uint row = i / 4;
         int idx = (lane_row * 4 + row) * 16 + lane_col;
-        scores[idx] += acc[i];
+        scores[idx] = acc[i];
     }
 
     __syncthreads();
