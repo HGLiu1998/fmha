@@ -72,18 +72,20 @@ void fmha_mfma(
         if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
-        
+
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+        if (tid == 0) {
+            printf("%f, %f, %f, %f\n", acc[0], acc[1], acc[2], acc[3]);
+        }
     }
 
     for (int i = 0; i < 4; ++i) {
         const uint row = i / 4;
         int idx = (lane_row * 4 + row) * 16 + lane_col;
-        scores[idx] = acc[i];
+        scores[idx] += acc[i];
     }
 
     if (tid == 0) {
-
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("%f ", scores[i]);
         }
