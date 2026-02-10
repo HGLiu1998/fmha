@@ -74,9 +74,6 @@ void fmha_mfma(
         }
 
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        if (tid == 0) {
-            printf("%f, %f, %f, %f\n", acc[0], acc[1], acc[2], acc[3]);
-        }
     }
 
     for (int i = 0; i < 4; ++i) {
