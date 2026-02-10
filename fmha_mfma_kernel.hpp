@@ -75,7 +75,6 @@ void fmha_mfma(
         
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
     }
-    __builtin_amdgcn_s_barrier(0);            
 
     for (int i = 0; i < 4; ++i) {
         const uint row = i / 4;
