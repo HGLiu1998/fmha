@@ -61,9 +61,9 @@ void fmha_mfma(
     __shared__ __attribute__((aligned(128))) float scores[20];
 
     floatx4 acc = {0};
-
+    bf16x4 a = {0}, b = {0};
     for (int k = 0; k < head_dim_q; k += BK) {
-        bf16x4 a = {0}, b = {0};
+        
         const uint warp_idx = warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
