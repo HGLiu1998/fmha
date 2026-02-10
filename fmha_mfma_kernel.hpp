@@ -58,7 +58,11 @@ void fmha_mfma(
     const uint BK = 64; 
     
     const uint mem = seqlen_kv * seqlen_q;
-    __shared__ __attribute__((aligned(128))) float scores[260] = {0};
+    __shared__ __attribute__((aligned(128))) float scores[260];
+
+    if (tid == 0) {
+        printf("%f", scores[0]);
+    }
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
