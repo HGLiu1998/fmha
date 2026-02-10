@@ -47,11 +47,11 @@ void fmha_mfma(
     // ========================================================================
     // Adjust Pointers to This Batch + Head
     // ========================================================================
-    bhalf_t* Q_ptr = Q + (size_t)batch_idx * num_heads_q  * seqlen_q  * head_dim_q
+    const bhalf_t* Q_ptr = Q + (size_t)batch_idx * num_heads_q  * seqlen_q  * head_dim_q
                              + (size_t)head_idx  * seqlen_q  * head_dim_q;
-    bhalf_t* K_ptr = K + (size_t)batch_idx * num_heads_kv * seqlen_kv * head_dim_kv
+    const bhalf_t* K_ptr = K + (size_t)batch_idx * num_heads_kv * seqlen_kv * head_dim_kv
                              + (size_t)head_idx  * seqlen_kv * head_dim_kv;
-    bhalf_t* V_ptr = V + (size_t)batch_idx * num_heads_kv * seqlen_kv * head_dim_kv
+    const bhalf_t* V_ptr = V + (size_t)batch_idx * num_heads_kv * seqlen_kv * head_dim_kv
                              + (size_t)head_idx  * seqlen_kv * head_dim_kv;
     half_t* O_ptr = O + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
                       + (size_t)head_idx  * seqlen_q * head_dim_q;
@@ -63,7 +63,7 @@ void fmha_mfma(
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
     for (int k = 0; k < head_dim_q; k += BK) {
-        const uint warp_idx = warp_id * 16;
+        const uint warp_idx = k * BK + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
         if (warp_idx + aRegLoc < head_dim_q) {
@@ -80,9 +80,6 @@ void fmha_mfma(
             printf("%f, %f, %f, %f\n", (float)(acc[0]), (float)(acc[1]), (float)(acc[2]), (float)(acc[3]));
         }
         __syncthreads();
-        
-        Q_ptr += BK;
-        K_ptr += BK;
     }
 
     for (int i = 0; i < 4; ++i) {
