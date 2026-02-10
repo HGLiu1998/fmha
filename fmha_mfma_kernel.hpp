@@ -58,7 +58,7 @@ void fmha_mfma(
     const uint BK = 64; 
     
     const uint mem = seqlen_kv * seqlen_q;
-    __shared__ __attribute__((aligned(128))) float scores[mem];
+    __shared__ __attribute__((aligned(128))) float scores[20];
 
     floatx4 acc = {0};
 
