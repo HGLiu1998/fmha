@@ -73,9 +73,10 @@ void fmha_mfma(
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
         if (tid == 0) {
-            printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
-            printf("%f, %f, %f, %f\n", (float)b[0], b[1], b[2], b[3]);
+            printf("%f, %f, %f, %f\n", (float)(a[0]), (float)(a[1]), (float)(a[2]), (float)(a[3]));
+            printf("%f, %f, %f, %f\n", (float)(b[0]), (float)(b[1]), (float)(b[2]), (float)(b[3]));
         }
+        
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
     }
 
