@@ -12,6 +12,7 @@
 #include <cmath>
 #include <random>
 #include <chrono>
+#include <fstream>
 #include "fmha_mfma_kernel.hpp"
 
 // Type aliases for numeric types
@@ -212,6 +213,35 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 1, int wa
     for (int i = 0; i < std::min(5, (int)config.o_size()); i++) {
         std::cout << "  O[" << i << "] = " << static_cast<float>(h_O[i]) << "\n";
     }
+
+    // #region agent log — Host-side debug logging
+    {
+        std::ofstream dbg("/home/arliu/workspace/fmha/.cursor/debug.log", std::ios::app);
+        if (dbg.is_open()) {
+            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            dbg << "{\"timestamp\":" << ts
+                << ",\"location\":\"fmha_host.cpp:post_kernel\""
+                << ",\"message\":\"Host verification results\""
+                << ",\"hypothesisId\":\"all\""
+                << ",\"data\":{\"batch\":" << config.batch
+                << ",\"heads_q\":" << config.num_heads_q
+                << ",\"heads_kv\":" << config.num_heads_kv
+                << ",\"seqlen_q\":" << config.seqlen_q
+                << ",\"seqlen_kv\":" << config.seqlen_kv
+                << ",\"head_dim_q\":" << config.head_dim_q
+                << ",\"head_dim_kv\":" << config.head_dim_kv
+                << ",\"expected_score\":\"" << config.head_dim_q << " * 0.01 = " << config.head_dim_q * 0.01 << "\""
+                << ",\"O_samples\":[";
+            for (int i = 0; i < std::min(5, (int)config.o_size()); i++) {
+                if (i > 0) dbg << ",";
+                dbg << static_cast<float>(h_O[i]);
+            }
+            dbg << "]}}\n";
+            dbg.close();
+        }
+    }
+    // #endregion
 
     // Cleanup
     free(h_Q); free(h_K); free(h_V); free(h_O);
