@@ -57,7 +57,8 @@ void fmha_mfma(
                       + (size_t)head_idx  * seqlen_q * head_dim_q;
     const uint BK = 64; 
     
-    __shared__ __attribute__((aligned(128))) float scores[seqlen_kv * seqlen_q];
+    const uint mem = seqlen_kv * seqlen_q;
+    __shared__ __attribute__((aligned(128))) float scores[mem];
 
     floatx4 acc = {0};
 
@@ -72,11 +73,11 @@ void fmha_mfma(
         if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
-        acc = __builtin_amdgcn_mfma_f32_16x16x16_bf16(a, b, acc, 0, 0, 0);
+        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
     }
 
     for (int i = 0; i < 4; ++i) {
-        printf("%d: %d\n", tid, acc[0])
+        printf("%d: %f\n", tid, acc[0]);
     }
     
 }   
