@@ -112,7 +112,7 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
  * @param num_iterations Number of timed iterations (default: 100)
  * @param warm_ups Number of warm-up iterations (default: 50)
  */
-void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 100, int warm_ups = 50) {
+void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 1, int warm_ups = 0) {
     std::cout << "\n=== Running FMHA Benchmark ===\n";
     config.print();
 
@@ -293,11 +293,11 @@ int main(int argc, char* argv[]) {
         // Run all configurations
         for (size_t i = 0; i < configs.size(); i++) {
             std::cout << "\n=== Configuration " << i << " ===\n";
-            run_fmha_benchmark(configs[i], 100);
+            run_fmha_benchmark(configs[i], 1);
         }
     } else {
         // Run single configuration
-        run_fmha_benchmark(configs[config_index], 100);
+        run_fmha_benchmark(configs[config_index], 1);
     }
 
     std::cout << "\n\nBenchmark completed successfully!\n";
