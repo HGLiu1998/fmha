@@ -41,8 +41,8 @@ void fmha_mfma(
     const int warp_id   = tid / 64;// [0, 4)
     const int lane_id   = tid % 64;   // [0, 64)
 
-    const int lane_row   = lane_id / 4;  // row in 16x16 result
-    const int lane_col = lane_id % 4;  // which 4-column block (0-3)
+    const int lane_row   = lane_id / 16;  // row in 16x16 result
+    const int lane_col = lane_id % 16;  // which 4-column block (0-3)
 
     // ========================================================================
     // Adjust Pointers to This Batch + Head
