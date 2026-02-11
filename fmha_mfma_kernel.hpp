@@ -89,10 +89,26 @@ void fmha_mfma(
     }
 
     __syncthreads();
+
+    float maxVal = -INFINITY;
+    float sumExp = 0.0f;
+    if (tid < seqlen_kv) {
+        maxVal = fmaxf(maxVal, scores[tid]);
+        scores[tid] = expf(scores[tid] - maxVal);
+        sumExp = scores[tid];
+    }
+    for (int i = CEIL(seqlen_kv,2) ; i > 0; i /= 2) {
+        sumExp += __shfl_xor(sumExp, i);
+    }
+    if (tid < seqlen_kv) {
+        scores[tid] /= sumExp;
+    }
+    __syncthreads();
+
     if (tid == 0) {
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("%f ", scores[i]);
         }
     }
-    
+
 }   
