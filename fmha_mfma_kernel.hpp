@@ -97,7 +97,7 @@ void fmha_mfma(
         scores[tid] = expf(scores[tid] - maxVal);
         sumExp = scores[tid];
     }
-    for (int i = CEIL(seqlen_kv,2) ; i > 0; i /= 2) {
+    for (int i = CEIL_DIV(seqlen_kv,2) ; i > 0; i /= 2) {
         sumExp += __shfl_xor(sumExp, i);
     }
     if (tid < seqlen_kv) {
