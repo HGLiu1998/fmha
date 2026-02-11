@@ -293,11 +293,11 @@ int main(int argc, char* argv[]) {
     // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, seqlen_kv, head_dim_q, head_dim_kv)
     std::vector<FMHAConfig> configs = {
         // Test various seqlen_kv values (1-16) with 16 heads, head_dim=128
-        FMHAConfig(1, 1, 1, 1, 1, 128, 128),   // Config 0
-        FMHAConfig(1, 1, 1, 1, 2, 128, 128),   // Config 1
-        FMHAConfig(1, 1, 1, 1, 4, 128, 128),   // Config 2
-        FMHAConfig(1, 1, 1, 1, 8, 128, 128),   // Config 3
-        FMHAConfig(1, 1, 1, 1, 16, 128, 128),  // Config 4
+        FMHAConfig(1, 16, 16, 1, 1, 128, 128),   // Config 0
+        FMHAConfig(1, 16, 16, 1, 2, 128, 128),   // Config 1
+        FMHAConfig(1, 16, 16, 1, 4, 128, 128),   // Config 2
+        FMHAConfig(1, 16, 16, 1, 8, 128, 128),   // Config 3
+        FMHAConfig(1, 16, 16, 1, 16, 128, 128),  // Config 4
         
         // Test various seqlen_kv values with 16 heads, head_dim=256
         FMHAConfig(30720, 16, 16, 1, 1, 256, 256),   // Config 5
