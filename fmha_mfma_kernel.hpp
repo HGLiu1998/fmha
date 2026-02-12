@@ -132,7 +132,7 @@ void fmha_mfma(
         __syncthreads();
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
         const uint cRegLoc = lane_col + dim_idx;
-        if (tid == 0 || tid == 16 || tid == 64 && head_idx == 0 && batch_idx == 0)  {
+        if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
             printf("%f, %f, %f, %f", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
             printf("%f, %f, %f, %f", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
