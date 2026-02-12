@@ -134,8 +134,8 @@ void fmha_mfma(
         const uint cRegLoc = lane_col + dim_idx;
         O_ptr[cRegLoc] = static_cast<half_t>(acc[0]);
     }
-    printf("\nFinal output:\n");
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+        printf("\nFinal output:\n");
         for (int i = 0; i < head_dim_q; ++i) {
             printf("%f ", (float)O_ptr[i]);
         }
