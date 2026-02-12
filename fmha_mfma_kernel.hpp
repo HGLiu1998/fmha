@@ -136,5 +136,6 @@ void fmha_mfma(
         O_ptr[cRegLoc] = static_cast<half_t>(acc[0]);
         if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
             printf("\n%f \n", (float)O_ptr[cRegLoc]);
+        }
     }
 }   
