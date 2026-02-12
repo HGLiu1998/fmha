@@ -59,7 +59,7 @@ void fmha_mfma(
     
     const uint mem = seqlen_kv * seqlen_q;
     __shared__ __attribute__((aligned(128))) float scores[256];
-    __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[16];
+    __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[256];
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
@@ -126,8 +126,8 @@ void fmha_mfma(
         const uint dim_idx = d * BK + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
-        if (aRegLoc < seqlen_kv) {
-            a = *(bf16x4*)(&softmax_scores[aRegLoc]);
+        if (dim_idx + aRegLoc < seqlen_kv) {
+            a = *(bf16x4*)(&softmax_scores[dim_idx + aRegLoc]);
         }
         if (dim_idx * seqlen_kv + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&V_ptr[dim_idx * seqlen_kv + bRegLoc]);
