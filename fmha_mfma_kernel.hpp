@@ -139,7 +139,7 @@ void fmha_mfma(
             if (cRegLoc < head_dim_q) {
                 O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
             }
-            if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+            if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
                 printf("%d\n", cRegLoc);
                 printf("%f ", (float)O_ptr[cRegLoc]);
             }
