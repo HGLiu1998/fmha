@@ -107,6 +107,9 @@ void fmha_mfma(
         scores[tid] /= sumExp;
         softmax_scores[tid] = static_cast<__bf16>(scores[tid]); 
     }
+    if (tid >= seqlen_kv && tid < 16) {
+        softmax_scores[tid] = static_cast<__bf16>(0.0f);
+    }
     __syncthreads();
 
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
@@ -134,9 +137,9 @@ void fmha_mfma(
         const uint cRegLoc = lane_col + dim_idx;
         if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
-            printf("%f, %f, %f, %f", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
-            printf("%f, %f, %f, %f", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
-            printf("%f, %f, %f, %f", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
+            printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
+            printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
+            printf("%f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
         }
         __syncthreads();
 
