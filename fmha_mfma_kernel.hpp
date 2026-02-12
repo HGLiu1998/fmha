@@ -86,12 +86,12 @@ void fmha_mfma(
 
     __syncthreads();
 
-    if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("\nScores:\n");
-        for (int i = 0; i < seqlen_kv; ++i) {
-            printf("%f ", scores[i]);
-        }
-    }
+    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+    //    printf("\nScores:\n");
+    //    for (int i = 0; i < seqlen_kv; ++i) {
+    //        printf("%f ", scores[i]);
+    //    }
+    //}
 
     float maxVal = -INFINITY;
     float sumExp = 0.0f;
@@ -112,12 +112,12 @@ void fmha_mfma(
     }
     __syncthreads();
 
-    if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("\nSoftmax:\n");
-        for (int i = 0; i < seqlen_kv; ++i) {
-            printf("%f ", (float)softmax_scores[i]);
-        }
-    }
+    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+    //    printf("\nSoftmax:\n");
+    //    for (int i = 0; i < seqlen_kv; ++i) {
+    //        printf("%f ", (float)softmax_scores[i]);
+    //    }
+    //}
     a = {0};
     b = {0};
 
@@ -140,20 +140,20 @@ void fmha_mfma(
                 O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
             }
         }
-        if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
-            printf("\nAcc %d:\n", tid);
-            printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
-            printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
-            printf("%f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
-        }
+        //if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
+        //    printf("\nAcc %d:\n", tid);
+        //    printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
+        //    printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
+        //    printf("%f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
+        //}
         __syncthreads();
 
     }
-    __syncthreads();
-    if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("\nFinal output:\n");
-        for (int i = 0; i < head_dim_q; ++i) {
-            printf("%f ", (float)O_ptr[i]);
-        }
-    }
+    //__syncthreads();
+    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+    //    printf("\nFinal output:\n");
+    //    for (int i = 0; i < head_dim_q; ++i) {
+    //       printf("%f ", (float)O_ptr[i]);
+    //    }
+    //}
 }   
