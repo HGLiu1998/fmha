@@ -139,6 +139,10 @@ void fmha_mfma(
             if (cRegLoc < head_dim_q) {
                 O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
             }
+            if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+                printf("%d\n", cRegLoc);
+                printf("%f ", (float)O_ptr[cRegLoc]);
+            }
         }
         const uint cRegLoc = lane_lane_col + dim_idx;
         if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
