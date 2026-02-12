@@ -136,6 +136,8 @@ void fmha_mfma(
     }
     printf("\nFinal output:\n");
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-            printf("%f", (float)O_ptr[cRegLoc]);
+        for (int i = 0; i < dim_idx; ++i) {
+            printf("%f ", (float)O_ptr[i]);
+            }
     }
 }   
