@@ -133,8 +133,9 @@ void fmha_mfma(
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
         const uint cRegLoc = lane_col + dim_idx;
         O_ptr[cRegLoc] = static_cast<half_t>(acc[0]);
-        if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-            printf("\n%f \n", (float)O_ptr[cRegLoc]);
-        }
+    }
+    printf("\nFinal output:\n");
+    if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+            printf("%f", (float)O_ptr[cRegLoc]);
     }
 }   
