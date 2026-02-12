@@ -139,12 +139,8 @@ void fmha_mfma(
             if (cRegLoc < head_dim_q) {
                 O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
             }
-            if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
-                printf("%d\n", cRegLoc);
-                printf("%f ", (float)O_ptr[cRegLoc]);
-            }
         }
-        if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
+        if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
             printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
             printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
