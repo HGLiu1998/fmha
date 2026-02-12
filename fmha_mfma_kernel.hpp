@@ -60,7 +60,6 @@ void fmha_mfma(
     const uint mem = seqlen_kv * seqlen_q;
     __shared__ __attribute__((aligned(128))) float scores[260];
     __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[16];
-    __shared__ __attribute__((aligned(128))) bhalf_t Os[]
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
@@ -88,7 +87,7 @@ void fmha_mfma(
     __syncthreads();
 
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("\nScores:\n")
+        printf("\nScores:\n");
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("%f ", scores[i]);
         }
@@ -111,7 +110,7 @@ void fmha_mfma(
     __syncthreads();
 
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("\nSoftmax:\n")
+        printf("\nSoftmax:\n");
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("%f ", (float)softmax_scores[i]);
         }
@@ -127,8 +126,8 @@ void fmha_mfma(
         if (aRegLoc < seqlen_kv) {
             a = *(bf16x4*)(&softmax_scores[aRegLoc]);
         }
-        if (warp_idx * seqlen_kv + bRegLoc < seqlen_kv * head_dim_kv) {
-            b = *(bf16x4*)(&V_ptr[warp_idx * seqlen_kv + bRegLoc]);
+        if (dim_idx * seqlen_kv + bRegLoc < seqlen_kv * head_dim_kv) {
+            b = *(bf16x4*)(&V_ptr[dim_idx * seqlen_kv + bRegLoc]);
         }
         __syncthreads();
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
