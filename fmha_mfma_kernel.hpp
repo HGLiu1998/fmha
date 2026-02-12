@@ -138,6 +138,7 @@ void fmha_mfma(
             printf("%f, %f, %f, %f", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
             printf("%f, %f, %f, %f", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
         }
+        __syncthreads();
 
         O_ptr[cRegLoc] = static_cast<half_t>(acc[0]);
     }
