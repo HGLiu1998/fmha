@@ -58,7 +58,7 @@ void fmha_mfma(
     const uint BK = 64; 
     
     const uint mem = seqlen_kv * seqlen_q;
-    __shared__ __attribute__((aligned(128))) float scores[260];
+    __shared__ __attribute__((aligned(128))) float scores[256];
     __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[16];
 
     floatx4 acc = {0};
@@ -134,7 +134,13 @@ void fmha_mfma(
         }
         __syncthreads();
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        const uint cRegLoc = lane_col + dim_idx;
+        for (int i = 0; i < 4; ++i) {
+            const uint cRegLoc = (lane_row * 4 + i) * head_dim_q + lane_col + dim_idx; 
+            if (cRegLoc < head_dim_q) {
+                O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
+            }
+        }
+        const uint cRegLoc = lane_lane_col + dim_idx;
         if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
             printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
@@ -143,7 +149,6 @@ void fmha_mfma(
         }
         __syncthreads();
 
-        O_ptr[cRegLoc] = static_cast<half_t>(acc[0]);
     }
     __syncthreads();
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
