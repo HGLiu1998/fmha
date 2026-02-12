@@ -144,7 +144,6 @@ void fmha_mfma(
                 printf("%f ", (float)O_ptr[cRegLoc]);
             }
         }
-        const uint cRegLoc = lane_lane_col + dim_idx;
         if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
             printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
