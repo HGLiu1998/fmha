@@ -101,7 +101,67 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     }
 }
 
+__host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
+{
 
+    float scores[config.batch * config.num_heads_q * 16] = {0};
+    for (int b = 0; b < config.batch; b++) {
+        for (int h = 0; h < config.num_heads_q; h++) {
+            for (int s = 0; s < config.seqlen_kv; s++) {
+                float sum = 0;
+                for (int d = 0; d < config.head_dim_q; d++) {
+                    bhalf_t a = h_Q[b * config.seqlen_q * config.head_dim_q * config.num_heads_q + h * config.seqlen_q * config.head_dim_q + d];
+                    bhalf_t b = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
+                    sum += (float)(a * b);                 
+                }
+                scores[b * config.num_heads_q * 16 + h * 16 + s] = sum;
+            }
+        }
+    }
+
+    for (int b = 0; b < config.batch; b++) {
+        for (int h = 0; h < config.num_heads_q; h++) {
+            bhalf_t softmax_scores[16] = {0};
+            float maxVal = -INFINITY;
+            float sumExp = 0.0f;
+            for (int s = 0; s < config.seqlen_kv; s++) {
+                maxVal = fmaxf(maxVal, scores[b * config.num_heads_q * 16 + h * 16 + s]);
+            }
+            for (int s = 0; s < config.seqlen_kv; s++) {
+                sumExp += expf(scores[b * config.num_heads_q * 16 + h * 16 + s] - maxVal);
+            }
+            for (int s = 0; s < config.seqlen_kv; s++) {
+                softmax_scores[s] = static_cast<bhalf_t>(expf(scores[b * config.num_heads_q * 16 + h * 16 + s] - maxVal) / sumExp);
+            }
+            float sum = 0;
+            for (int d = 0; d < config.head_dim_q; d++) {
+                for (int s = 0; s < config.seqlen_kv; s++) {
+                    sum += (float)(softmax_scores[s] * h_V[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s + d * config.seqlen_kv]);
+                }
+                ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + d] = static_cast<half_t>(sum);
+            }
+        }
+    }
+    
+    bool res = true;
+    for (int b = 0; b < config.batch; b++) {
+        for (int h = 0; h < config.num_heads_q; h++) {
+            for (int s = 0; s < config.seqlen_q; s++) {
+                for (int d = 0; d < config.head_dim_q; d++) {
+                    double o = (float)h_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
+                    double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
+                    double err = abs(o - r);
+                    if (err > 1e-3 + 1e-3 * std::abs(r)) {
+                        std::cout << "Error! out " << o << "!= ref" << r << endl;
+                        res = false;
+                    }
+                }
+            }
+        }
+    }
+    return res;
+
+}
 /**
  * FMHA Benchmark Runner
  * 
@@ -124,6 +184,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     bhalf_t *h_K = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
     bhalf_t *h_V = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
     half_t  *h_O = (half_t*)malloc(config.o_size() * sizeof(half_t));
+    half_t  *ref_O = (half_t*)malloc(config.o_size() * sizeof(half_t));
 
     // Initialize with random data
     std::cout << "\nInitializing tensors...\n";
@@ -191,13 +252,12 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     
     // Estimate FLOPs: 2 matmuls (Q@K^T and P@V), each MAC = 2 FLOPs
     // Note: Doesn't include softmax ops (exp, div)
-    long long flops_per_iter = 2LL * config.batch * config.num_heads_q *
+    long long flops_per_iter = 4 * config.batch * config.num_heads_q *
                                config.seqlen_q * config.seqlen_kv * config.head_dim_q;
     double tflops = (flops_per_iter / (avg_time_ms / 1000.0)) / 1e12;
 
     // Display results
     std::cout << "\n=== Performance Results ===\n";
-    std::cout << "Average time:  " << avg_time_ms << " ms\n";
     std::cout << "Throughput:    " << 1000.0 / avg_time_ms << " iter/s\n";
     std::cout << "Performance:   " << tflops << " TFLOPS\n";
 
@@ -210,42 +270,10 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
         1.0f / sqrt(config.head_dim_q));
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
-    std::cout << "\nSample outputs (sanity check):\n";
-    for (int i = 0; i < std::min(5, (int)config.o_size()); i++) {
-        std::cout << "  O[" << i << "] = " << static_cast<float>(h_O[i]) << "\n";
-    }
-
-    // #region agent log — Host-side debug logging
-    {
-        std::ofstream dbg("/home/arliu/workspace/fmha/.cursor/debug.log", std::ios::app);
-        if (dbg.is_open()) {
-            auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            dbg << "{\"timestamp\":" << ts
-                << ",\"location\":\"fmha_host.cpp:post_kernel\""
-                << ",\"message\":\"Host verification results\""
-                << ",\"hypothesisId\":\"all\""
-                << ",\"data\":{\"batch\":" << config.batch
-                << ",\"heads_q\":" << config.num_heads_q
-                << ",\"heads_kv\":" << config.num_heads_kv
-                << ",\"seqlen_q\":" << config.seqlen_q
-                << ",\"seqlen_kv\":" << config.seqlen_kv
-                << ",\"head_dim_q\":" << config.head_dim_q
-                << ",\"head_dim_kv\":" << config.head_dim_kv
-                << ",\"expected_score\":\"" << config.head_dim_q << " * 0.01 = " << config.head_dim_q * 0.01 << "\""
-                << ",\"O_samples\":[";
-            for (int i = 0; i < std::min(5, (int)config.o_size()); i++) {
-                if (i > 0) dbg << ",";
-                dbg << static_cast<float>(h_O[i]);
-            }
-            dbg << "]}}\n";
-            dbg.close();
-        }
-    }
-    // #endregion
+    do_validation(config, h_Q, h_K, h_V, ref_O, h_O);
 
     // Cleanup
-    free(h_Q); free(h_K); free(h_V); free(h_O);
+    free(h_Q); free(h_K); free(h_V); free(h_O); free(ref_O);
     HIP_CHECK(hipFree(d_Q));
     HIP_CHECK(hipFree(d_K));
     HIP_CHECK(hipFree(d_V));
