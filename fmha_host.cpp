@@ -101,7 +101,6 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     }
 }
 
-__host__ void 
 
 /**
  * FMHA Benchmark Runner
