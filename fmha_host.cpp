@@ -105,9 +105,12 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
 {
     std::cout << "start validation" << std::endl;
 
-    float scores[config.batch * config.num_heads_q * 16];
+    float scores[16] = {0};
+    bool res = true;
+
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
+            // Step 1: Compute Q @ K^T scores for this head
             for (int s = 0; s < config.seqlen_kv; s++) {
                 float sum = 0;
                 for (int d = 0; d < config.head_dim_q; d++) {
@@ -115,25 +118,21 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
                     sum += (float)(q * k);                 
                 }
-                scores[b * config.num_heads_q * 16 + h * 16 + s] = sum;
+                scores[s] = sum;
             }
-        }
-    }
-    std::cout << "score calculation" << std::endl;
 
-    for (int b = 0; b < config.batch; b++) {
-        for (int h = 0; h < config.num_heads_q; h++) {
+            // Step 2: Softmax + P @ V for this head
             bhalf_t softmax_scores[16] = {0};
             float maxVal = -INFINITY;
             float sumExp = 0.0f;
             for (int s = 0; s < config.seqlen_kv; s++) {
-                maxVal = fmaxf(maxVal, scores[b * config.num_heads_q * 16 + h * 16 + s]);
+                maxVal = fmaxf(maxVal, scores[s]);
             }
             for (int s = 0; s < config.seqlen_kv; s++) {
-                sumExp += expf(scores[b * config.num_heads_q * 16 + h * 16 + s] - maxVal);
+                sumExp += expf(scores[s] - maxVal);
             }
             for (int s = 0; s < config.seqlen_kv; s++) {
-                softmax_scores[s] = static_cast<bhalf_t>(expf(scores[b * config.num_heads_q * 16 + h * 16 + s] - maxVal) / sumExp);
+                softmax_scores[s] = static_cast<bhalf_t>(expf(scores[s] - maxVal) / sumExp);
             }
             float sum = 0;
             for (int d = 0; d < config.head_dim_q; d++) {
@@ -143,10 +142,8 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                 ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + d] = static_cast<half_t>(sum);
             }
         }
-    }
-    std::cout << "ref calculation" << std::endl;
-    bool res = true;
-    for (int b = 0; b < config.batch; b++) {
+
+        // Step 3: Validate this batch element
         for (int h = 0; h < config.num_heads_q; h++) {
             for (int s = 0; s < config.seqlen_q; s++) {
                 for (int d = 0; d < config.head_dim_q; d++) {
@@ -161,6 +158,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             }
         }
     }
+    std::cout << "ref calculation" << std::endl;
     return res;
 
 }
