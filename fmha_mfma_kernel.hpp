@@ -86,13 +86,6 @@ void fmha_mfma(
 
     __syncthreads();
 
-    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-    //    printf("\nScores:\n");
-    //    for (int i = 0; i < seqlen_kv; ++i) {
-    //        printf("%f ", scores[i]);
-    //    }
-    //}
-
     float maxVal = -INFINITY;
     float sumExp = 0.0f;
     if (tid < seqlen_kv) {
@@ -112,12 +105,6 @@ void fmha_mfma(
     }
     __syncthreads();
 
-    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-    //    printf("\nSoftmax:\n");
-    //    for (int i = 0; i < seqlen_kv; ++i) {
-    //        printf("%f ", (float)softmax_scores[i]);
-    //    }
-    //}
     a = {0};
     b = {0};
 
@@ -149,11 +136,4 @@ void fmha_mfma(
         __syncthreads();
 
     }
-    //__syncthreads();
-    //if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
-    //    printf("\nFinal output:\n");
-    //    for (int i = 0; i < head_dim_q; ++i) {
-    //       printf("%f ", (float)O_ptr[i]);
-    //    }
-    //}
 }   
