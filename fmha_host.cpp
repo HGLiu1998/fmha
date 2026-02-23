@@ -134,8 +134,8 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             for (int s = 0; s < config.seqlen_kv; s++) {
                 softmax_scores[s] = static_cast<bhalf_t>(expf(scores[s] - maxVal) / sumExp);
             }
-            float sum = 0;
             for (int d = 0; d < config.head_dim_q; d++) {
+                float sum = 0;
                 for (int s = 0; s < config.seqlen_kv; s++) {
                     sum += (float)(softmax_scores[s] * h_V[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s + d * config.seqlen_kv]);
                 }
