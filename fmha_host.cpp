@@ -101,7 +101,7 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     }
 }
 
-__host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
+bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
 {
 
     float scores[config.batch * config.num_heads_q * 16];
@@ -118,6 +118,7 @@ __host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K
             }
         }
     }
+    std::cout << "score calculation" << endl;
 
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
@@ -142,7 +143,8 @@ __host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K
             }
         }
     }
-    
+    std::cout << "ref calculation" << endl;
+
     bool res = true;
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
@@ -270,7 +272,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
         1.0f / sqrt(config.head_dim_q));
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
-    //do_validation(config, h_Q, h_K, h_V, ref_O, h_O);
+    do_validation(config, h_Q, h_K, h_V, ref_O, h_O);
 
     // Cleanup
     free(h_Q); free(h_K); free(h_V); free(h_O); free(ref_O);
