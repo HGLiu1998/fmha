@@ -103,6 +103,7 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
 
 bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
 {
+    std::cout << "start validation" << std::endl;
 
     float scores[config.batch * config.num_heads_q * 16];
     for (int b = 0; b < config.batch; b++) {
