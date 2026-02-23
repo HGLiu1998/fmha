@@ -104,7 +104,7 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
 __host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
 {
 
-    float scores[config.batch * config.num_heads_q * 16] = {0};
+    float scores[config.batch * config.num_heads_q * 16];
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
             for (int s = 0; s < config.seqlen_kv; s++) {
@@ -152,7 +152,7 @@ __host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K
                     double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
                     double err = abs(o - r);
                     if (err > 1e-3 + 1e-3 * std::abs(r)) {
-                        std::cout << "Error! out " << o << "!= ref" << r << endl;
+                        std::cout << "Error! out " << o << "!= ref" << r << std::endl;
                         res = false;
                     }
                 }
