@@ -110,9 +110,9 @@ __host__ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K
             for (int s = 0; s < config.seqlen_kv; s++) {
                 float sum = 0;
                 for (int d = 0; d < config.head_dim_q; d++) {
-                    bhalf_t a = h_Q[b * config.seqlen_q * config.head_dim_q * config.num_heads_q + h * config.seqlen_q * config.head_dim_q + d];
-                    bhalf_t b = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
-                    sum += (float)(a * b);                 
+                    bhalf_t q = h_Q[b * config.seqlen_q * config.head_dim_q * config.num_heads_q + h * config.seqlen_q * config.head_dim_q + d];
+                    bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
+                    sum += (float)(q * k);                 
                 }
                 scores[b * config.num_heads_q * 16 + h * 16 + s] = sum;
             }
