@@ -118,7 +118,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             }
         }
     }
-    std::cout << "score calculation" << endl;
+    std::cout << "score calculation" << std::endl;
 
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
@@ -143,8 +143,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             }
         }
     }
-    std::cout << "ref calculation" << endl;
-
+    std::cout << "ref calculation" << std::endl
     bool res = true;
     for (int b = 0; b < config.batch; b++) {
         for (int h = 0; h < config.num_heads_q; h++) {
