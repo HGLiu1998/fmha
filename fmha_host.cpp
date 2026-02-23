@@ -252,7 +252,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     
     // Estimate FLOPs: 2 matmuls (Q@K^T and P@V), each MAC = 2 FLOPs
     // Note: Doesn't include softmax ops (exp, div)
-    long long flops_per_iter = 4 * config.batch * config.num_heads_q *
+    long long flops_per_iter = 4LL * config.batch * config.num_heads_q *
                                config.seqlen_q * config.seqlen_kv * config.head_dim_q;
     double tflops = (flops_per_iter / (avg_time_ms / 1000.0)) / 1e12;
 
