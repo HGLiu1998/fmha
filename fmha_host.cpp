@@ -96,8 +96,8 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
     for (size_t i = 0; i < N; i++) {
-        mat[i] = static_cast<bhalf_t>(dis(gen));
-        //mat[i] = static_cast<bhalf_t>(0.1f);
+        //mat[i] = static_cast<bhalf_t>(dis(gen));
+        mat[i] = static_cast<bhalf_t>(0.1f);
     }
 }
 
