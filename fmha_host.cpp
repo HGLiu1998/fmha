@@ -122,7 +122,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             }
             if (h == 0 && b == 0)  {
                 printf("Scores: ");
-                for (int i = 0; i < seqlen_kv; ++i) {
+                for (int i = 0; i < config.seqlen_kv; ++i) {
                     printf("%f ", scores[i]);
                 }
                 printf("\n");
