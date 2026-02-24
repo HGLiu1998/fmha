@@ -116,7 +116,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                 for (int d = 0; d < config.head_dim_q; d++) {
                     bhalf_t q = h_Q[b * config.seqlen_q * config.head_dim_q * config.num_heads_q + h * config.seqlen_q * config.head_dim_q + d];
                     bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
-                    sum += (float)(q * k);                 
+                    sum += (float)q * (float)k;                 
                 }
                 scores[s] = sum * (1.0f / sqrtf(config.head_dim_q));
             }
@@ -137,7 +137,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             for (int d = 0; d < config.head_dim_q; d++) {
                 float sum = 0;
                 for (int s = 0; s < config.seqlen_kv; s++) {
-                    sum += (float)(softmax_scores[s] * h_V[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s + d * config.seqlen_kv]);
+                    sum += (float)(softmax_scores[s] * (float)h_V[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s + d * config.seqlen_kv]);
                 }
                 ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + d] = static_cast<half_t>(sum);
             }
@@ -149,16 +149,16 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                 for (int d = 0; d < config.head_dim_q; d++) {
                     double o = (float)h_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
                     double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
-                    double err = abs(o - r);
+                    double err = std::abs(o - r);
                     if (err > 1e-3 + 1e-3 * std::abs(r)) {
-                        std::cout << "Error! out " << o << "!= ref" << r << std::endl;
+                        std::cout << "Error! out " << o << " != ref " << r << std::endl;
                         res = false;
                     }
                 }
             }
         }
     }
-    std::cout << "Validation success!" << std::endl;
+    if (res) std::cout << "Validation success!" << std::endl;
     return res;
 
 }
