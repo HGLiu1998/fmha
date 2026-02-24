@@ -118,7 +118,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
                     sum += (float)q * (float)k;                 
                 }
-                scores[s] = sum * (1.0f / sqrtf(config.head_dim_q));
+                scores[s] = sum;
             }
             if (h == 0 && b == 0)  {
                 printf("Scores: ");
@@ -126,6 +126,9 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     printf("%f ", scores[i]);
                 }
                 printf("\n");
+            }
+            for (int s = 0; s < config.seqlen_kv; s++) {
+                scores[s] *= (1.0f / sqrtf(config.head_dim_q));
             }
 
             // Step 2: Softmax + P @ V for this head

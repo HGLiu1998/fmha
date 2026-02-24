@@ -88,8 +88,9 @@ void fmha_mfma(
         }
         
     }
-    
 
+    __syncthreads();
+    
     if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
         printf("Scores: ");
         for (int i = 0; i < seqlen_kv; ++i) {
@@ -97,8 +98,6 @@ void fmha_mfma(
         }
         printf("\n");
     }
-
-    __syncthreads();
 
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;
