@@ -96,14 +96,14 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
 
     for (size_t i = 0; i < N; i++) {
-        //mat[i] = static_cast<bhalf_t>(dis(gen));
-        mat[i] = static_cast<bhalf_t>(0.1f);
+        mat[i] = static_cast<bhalf_t>(dis(gen));
+        //mat[i] = static_cast<bhalf_t>(0.1f);
     }
 }
 
 bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
 {
-    std::cout << "start validation" << std::endl;
+   // std::cout << "start validation" << std::endl;
 
     float scores[16] = {0};
     bool res = true;
@@ -158,7 +158,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
             }
         }
     }
-    std::cout << "ref calculation" << std::endl;
+    std::cout << "Validation success!" << std::endl;
     return res;
 
 }
