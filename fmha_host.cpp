@@ -118,7 +118,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
                     sum += (float)(q * k);                 
                 }
-                scores[s] = sum;
+                scores[s] = sum * (1.0f / sqrtf(config.head_dim_q));
             }
 
             // Step 2: Softmax + P @ V for this head

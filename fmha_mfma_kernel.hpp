@@ -127,10 +127,11 @@ void fmha_mfma(
         }
         printf("\n");
     }
-    a = {0};
-    b = {0};
+
 
     for (int d = 0; d < CEIL_DIV(head_dim_q, BK); d += 1) {
+        a = {0};
+        b = {0};
         acc = {0};
         const uint dim_idx = d * BK + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
@@ -138,10 +139,18 @@ void fmha_mfma(
         if (lane_col == 0) {
             a = *(bf16x4*)(&softmax_scores[aRegLoc]);
         }
-        if (dim_idx * seqlen_kv + bRegLoc < seqlen_kv * head_dim_kv) {
-            b = *(bf16x4*)(&V_ptr[dim_idx * seqlen_kv + bRegLoc]);
+        if (dim_idx + lane_col < head_dim_kv) {
+            if (lane_row * 4 + 4 <= seqlen_kv) {
+                b = *(bf16x4*)(&V_ptr[(dim_idx + lane_col) * seqlen_kv + lane_row * 4]);
+            } else {
+                for (int i = 0; i < 4; i++) {
+                    int s = lane_row * 4 + i;
+                    if (s < seqlen_kv) {
+                        b[i] = V_ptr[(dim_idx + lane_col) * seqlen_kv + s];
+                    }
+                }
+            }
         }
-        __syncthreads();
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
         for (int i = 0; i < 4; ++i) {
             const uint cRegLoc = (lane_row * 4 + i) * head_dim_q + lane_col + dim_idx; 
@@ -155,7 +164,6 @@ void fmha_mfma(
             printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
             printf("%f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
         }
-        __syncthreads();
 
     }
 }   
