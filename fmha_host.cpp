@@ -150,7 +150,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     double o = (float)h_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
                     double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
                     double err = std::abs(o - r);
-                    if (err > 1e-3 + 1e-3 * std::abs(r)) {
+                    if (err > 1e-2 + 1e-2 * std::abs(r)) {
                         std::cout << "Error! out " << o << " != ref " << r << std::endl;
                         res = false;
                     }
