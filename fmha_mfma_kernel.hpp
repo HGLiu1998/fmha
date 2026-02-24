@@ -84,7 +84,7 @@ void fmha_mfma(
         for (int i = 0; i < 4; ++i) {
             int idx = (lane_row * 4 + i) * 16 + lane_col;
             scores[idx] = acc[i];
-            //scores[idx] += acc[i];
+            //scores[idx] += acc[i]; need to use atomic add
         }
     }
 
@@ -120,13 +120,14 @@ void fmha_mfma(
     }
     __syncthreads();
 
+    /** 
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
         printf("\nSoftmax %d:\n", tid);
         for (int i = 0 ; i < seqlen_kv; i++) {
             printf("%f, ", (float)softmax_scores[i]);
         }
         printf("\n");
-    }
+    }*/
 
 
     for (int d = 0; d < CEIL_DIV(head_dim_q, BK); d += 1) {
