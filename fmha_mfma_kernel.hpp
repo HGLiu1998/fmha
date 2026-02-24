@@ -91,7 +91,7 @@ void fmha_mfma(
     
 
     if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("Scores: ")
+        printf("Scores: ");
         for (int i = 0; i < seqlen_kv; ++i) {
             printf("f ", scorse[i]);
         }
