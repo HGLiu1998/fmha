@@ -86,6 +86,16 @@ void fmha_mfma(
             scores[idx] = acc[i];
             //scores[idx] += acc[i]; need to use atomic add
         }
+        
+    }
+    
+
+    if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
+        printf("Scores: ")
+        for (int i = 0; i < seqlen_kv; ++i) {
+            printf("f ", scorse[i]);
+        }
+        printf("\n");
     }
 
     __syncthreads();
