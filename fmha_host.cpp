@@ -221,8 +221,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
         fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
                            config.batch, config.num_heads_q, config.num_heads_kv,
                            config.seqlen_q, config.seqlen_kv,
-                           config.head_dim_q, config.head_dim_kv,
-                           1.0f / sqrt(config.head_dim_q));
+                           config.head_dim_q, config.head_dim_kv);
     }
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -236,8 +235,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
         fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
                            config.batch, config.num_heads_q, config.num_heads_kv,
                            config.seqlen_q, config.seqlen_kv,
-                           config.head_dim_q, config.head_dim_kv,
-                           1.0f / sqrt(config.head_dim_q));
+                           config.head_dim_q, config.head_dim_kv);
     }
     HIP_CHECK(hipEventRecord(end, NULL));
     HIP_CHECK(hipEventSynchronize(end));
@@ -266,8 +264,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
         config.batch, config.num_heads_q, config.num_heads_kv,
         config.seqlen_q, config.seqlen_kv,
-        config.head_dim_q, config.head_dim_kv,
-        1.0f / sqrt(config.head_dim_q));
+        config.head_dim_q, config.head_dim_kv);
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
     do_validation(config, h_Q, h_K, h_V, ref_O, h_O);

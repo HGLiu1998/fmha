@@ -29,8 +29,7 @@ void fmha_mfma(
     const int seqlen_q,                // always 1 (decode)
     const int seqlen_kv,               // 1-16
     const int head_dim_q,              // 128 or 256
-    const int head_dim_kv,             // 128 or 256
-    const float softmax_scale)
+    const int head_dim_kv)
 {
     // ========================================================================
     // Block / Thread Mapping
@@ -57,13 +56,15 @@ void fmha_mfma(
                       + (size_t)head_idx  * seqlen_q * head_dim_q;
     const uint BK = 64; 
     
-    const uint mem = seqlen_kv * seqlen_q;
     __shared__ __attribute__((aligned(128))) float scores[256];
     __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[256];
 
+    scores[tid] = 0.0f;
+    __syncthreads();
+
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
-    for (int k = 0; k < head_dim_q; k += BK) {
+    for (int k = 0; k < CEIL_DIV(head_dim_q, BK); k += 1) {
         const uint warp_idx = k * BK + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
@@ -73,27 +74,36 @@ void fmha_mfma(
         if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
         }
-        __syncthreads();
 
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+        __syncthreads();
+
     }
 
     for (int i = 0; i < 4; ++i) {
-        const uint row = i / 4;
-        int idx = (lane_row * 4 + row) * 16 + lane_col;
-        scores[idx] += acc[i];
+        int idx = (lane_row * 4 + i) * 16 + lane_col;
+        atomicAdd(scores[idx], acc[i]);
+        //scores[idx] += acc[i];
     }
 
     __syncthreads();
 
+    // Step 1: Find global max
     float maxVal = -INFINITY;
+    if (tid < seqlen_kv) {
+        maxVal = scores[tid];
+    }
+    // Reduce max across threads
+    for (int i = 8; i > 0; i /= 2) {
+        maxVal = fmaxf(maxVal, __shfl_xor(maxVal, i));
+    }
+    // Step 2: Compute exp and sum
     float sumExp = 0.0f;
     if (tid < seqlen_kv) {
-        maxVal = fmaxf(maxVal, scores[tid]);
         scores[tid] = expf(scores[tid] - maxVal);
         sumExp = scores[tid];
     }
-    for (int i = CEIL_DIV(seqlen_kv,2) ; i > 0; i /= 2) {
+    for (int i = 8; i > 0; i /= 2) {
         sumExp += __shfl_xor(sumExp, i);
     }
     if (tid < seqlen_kv) {
@@ -115,13 +125,13 @@ void fmha_mfma(
     a = {0};
     b = {0};
 
-    for (int d = 0; d < head_dim_q; d += BK) {
+    for (int d = 0; d < CEIL_DIV(head_dim_q, BK); d += 1) {
         acc = {0};
         const uint dim_idx = d * BK + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
-        const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
-        if (dim_idx + aRegLoc < seqlen_kv) {
-            a = *(bf16x4*)(&softmax_scores[dim_idx + aRegLoc]);
+        const uint bRegLoc = lane_row * 4 + lane_col * seqlen_kv;
+        if (lane_col == 0) {
+            a = *(bf16x4*)(&softmax_scores[aRegLoc]);
         }
         if (dim_idx * seqlen_kv + bRegLoc < seqlen_kv * head_dim_kv) {
             b = *(bf16x4*)(&V_ptr[dim_idx * seqlen_kv + bRegLoc]);
@@ -134,7 +144,7 @@ void fmha_mfma(
                 O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
             }
         }
-        if (tid == 64 && head_idx == 0 && batch_idx == 0)  {
+        if ((tid == 64 || tid == 0) && head_idx == 0 && batch_idx == 0)  {
             printf("\nAcc %d:\n", tid);
             printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
             printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
