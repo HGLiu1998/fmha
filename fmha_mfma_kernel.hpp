@@ -29,7 +29,8 @@ void fmha_mfma(
     const int seqlen_q,                // always 1 (decode)
     const int seqlen_kv,               // 1-16
     const int head_dim_q,              // 128 or 256
-    const int head_dim_kv)
+    const int head_dim_kv,
+    const float softmax_scale)
 {
     // ========================================================================
     // Block / Thread Mapping
@@ -64,30 +65,34 @@ void fmha_mfma(
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
-    for (int k = 0; k < CEIL_DIV(head_dim_q, BK); k += 1) {
-        const uint warp_idx = k * BK + warp_id * 16;
-        const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
-        const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
-        if (warp_idx + aRegLoc < head_dim_q) {
-            a = *(bf16x4*)(&Q_ptr[warp_idx + aRegLoc]);
+    if (warp_id == 0) {
+        for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
+            const uint warp_idx = k * 16;
+            const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
+            const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
+            if (warp_idx + aRegLoc < head_dim_q) {
+                a = *(bf16x4*)(&Q_ptr[warp_idx + aRegLoc]);
+            }
+            if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
+                b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
+            }
+
+            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+
         }
-        if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
-            b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
+        
+        for (int i = 0; i < 4; ++i) {
+            int idx = (lane_row * 4 + i) * 16 + lane_col;
+            scores[idx] = acc[i];
+            //scores[idx] += acc[i];
         }
-
-        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        __syncthreads();
-
-    }
-
-    for (int i = 0; i < 4; ++i) {
-        int idx = (lane_row * 4 + i) * 16 + lane_col;
-        atomicAdd(scores[idx], acc[i]);
-        //scores[idx] += acc[i];
     }
 
     __syncthreads();
 
+    if (tid < seqlen_kv) {
+        scores[tid] *= softmax_scale;
+    }
     // Step 1: Find global max
     float maxVal = -INFINITY;
     if (tid < seqlen_kv) {
@@ -141,7 +146,7 @@ void fmha_mfma(
         for (int i = 0; i < 4; ++i) {
             const uint cRegLoc = (lane_row * 4 + i) * head_dim_q + lane_col + dim_idx; 
             if (cRegLoc < head_dim_q) {
-                O_ptr[cRegLoc] += static_cast<half_t>(acc[i]);
+                O_ptr[cRegLoc] = static_cast<half_t>(acc[i]);
             }
         }
         if ((tid == 64 || tid == 0) && head_idx == 0 && batch_idx == 0)  {
