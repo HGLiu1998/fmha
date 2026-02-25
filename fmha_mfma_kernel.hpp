@@ -65,39 +65,32 @@ void fmha_mfma(
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
-    if (warp_id == 0) {
-        for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
-            const uint warp_idx = k * 16;
-            const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
-            const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
-            if (warp_idx + aRegLoc < head_dim_q) {
-                a = *(bf16x4*)(&Q_ptr[warp_idx + aRegLoc]);
-            }
-            if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
-                b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
-            }
 
-            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+    for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
+        const uint warp_idx = k * 16;
+        const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
+        const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
+        if (warp_idx + aRegLoc < head_dim_q) {
+            a = *(bf16x4*)(&Q_ptr[warp_idx + aRegLoc]);
+        }
+        if (warp_idx + bRegLoc < seqlen_kv * head_dim_kv) {
+            b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
+        }
 
-        }
-        
-        for (int i = 0; i < 4; ++i) {
-            int idx = (lane_row * 4 + i) * 16 + lane_col;
-            scores[idx] = acc[i];
-            //scores[idx] += acc[i]; need to use atomic add
-        }
-        
+        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
+
     }
+        
+    for (int i = 0; i < 4; ++i) {
+        int idx = (lane_row * 4 + i) * 16 + lane_col;
+        //scores[idx] = acc[i];
+        atomicAdd(&scores[idx], acc[i]);
+        //scores[idx] += acc[i]; need to use atomic add
+    }
+        
+    
 
     __syncthreads();
-    
-    if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
-        printf("Scores: ");
-        for (int i = 0; i < seqlen_kv; ++i) {
-            printf("%f ", scores[i]);
-        }
-        printf("\n");
-    }
 
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;

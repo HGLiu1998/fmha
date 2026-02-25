@@ -120,13 +120,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                 }
                 scores[s] = sum;
             }
-            if (h == 0 && b == 0)  {
-                printf("Scores: ");
-                for (int i = 0; i < config.seqlen_kv; ++i) {
-                    printf("%f ", scores[i]);
-                }
-                printf("\n");
-            }
+           
             for (int s = 0; s < config.seqlen_kv; s++) {
                 scores[s] *= (1.0f / sqrtf(config.head_dim_q));
             }
