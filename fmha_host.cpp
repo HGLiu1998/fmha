@@ -120,7 +120,13 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                 }
                 scores[s] = sum;
             }
-           
+            if (h == 0 && b == 0)  {
+                printf("Scores: ");
+                for (int i = 0; i < config.seqlen_kv; ++i) {
+                    printf("%f ", scores[i]);
+                }
+                printf("\n");
+            }
             for (int s = 0; s < config.seqlen_kv; s++) {
                 scores[s] *= (1.0f / sqrtf(config.head_dim_q));
             }
@@ -155,7 +161,7 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
                     double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
                     double err = std::abs(o - r);
                     if (err > 1e-2 + 1e-2 * std::abs(r)) {
-                        std::cout << "Error! out " << o << " != ref " << r << std::endl;
+                        //std::cout << "Error! out " << o << " != ref " << r << std::endl;
                         res = false;
                     }
                 }

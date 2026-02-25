@@ -66,8 +66,8 @@ void fmha_mfma(
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
 
-    for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
-        const uint warp_idx = k * 16;
+    for (int k = 0; k < CEIL_DIV(head_dim_q, 64); k += 1) {
+        const uint warp_idx = k * 64 + warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * head_dim_kv;
         if (warp_idx + aRegLoc < head_dim_q) {
@@ -85,9 +85,16 @@ void fmha_mfma(
         int idx = (lane_row * 4 + i) * 16 + lane_col;
         //scores[idx] = acc[i];
         atomicAdd(&scores[idx], acc[i]);
-        //scores[idx] += acc[i]; need to use atomic add
     }
-        
+    
+    if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
+        printf("Scores: ");
+        for (int i = 0; i < seqlen_kv; ++i) {
+            printf("%f ", scores[i]);
+        }
+        printf("\n");
+    }
+
     
 
     __syncthreads();
