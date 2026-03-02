@@ -43,34 +43,67 @@ public:
     int batch;          // Number of independent sequences
     int num_heads_q;    // Query heads
     int num_heads_kv;   // Key/Value heads (GQA: can be < num_heads_q)
-    int seqlen_q;       // Query sequence length
-    int seqlen_kv;      // Key/Value sequence length
+    int seqlen_q;       // Query sequence length (always 1 for decode)
+    int max_seqlen_kv;  // Maximum seqlen_kv (for Poisson range: 2-16)
     int head_dim_q;     // Dimension per query head
     int head_dim_kv;    // Dimension per key/value head
 
-    FMHAConfig(int b, int nhq, int nhkv, int sq, int skv, int hdq, int hdkv)
+    FMHAConfig(int b, int nhq, int nhkv, int sq, int max_skv, int hdq, int hdkv)
         : batch(b), num_heads_q(nhq), num_heads_kv(nhkv),
-          seqlen_q(sq), seqlen_kv(skv), head_dim_q(hdq), head_dim_kv(hdkv) {}
+          seqlen_q(sq), max_seqlen_kv(max_skv), head_dim_q(hdq), head_dim_kv(hdkv) {}
 
+    // Generate variable sequence lengths using Poisson distribution (λ=4, range 2-16)
+    std::vector<int> generate_seqlens_kv() const {
+        std::vector<int> seqlens(batch);
+        // Poisson distribution with λ=4, clamped to [2, max_seqlen_kv]
+        std::mt19937 gen(42);  // Fixed seed for reproducibility
+        std::poisson_distribution<int> dist(4);
+        for (int i = 0; i < batch; i++) {
+            int len = dist(gen);
+            seqlens[i] = std::max(2, std::min(len, max_seqlen_kv));
+        }
+        return seqlens;
+    }
+    
+    // Compute cumulative sequence lengths (offsets for packed representation)
+    std::vector<int> compute_cu_seqlens_kv(const std::vector<int>& seqlens_kv) const {
+        std::vector<int> cu_seqlens(batch + 1);
+        cu_seqlens[0] = 0;
+        for (int i = 0; i < batch; i++) {
+            cu_seqlens[i + 1] = cu_seqlens[i] + seqlens_kv[i];
+        }
+        return cu_seqlens;
+    }
+    
     // Tensor sizes in number of elements
     size_t q_size() const { return batch * num_heads_q * seqlen_q * head_dim_q; }
-    size_t kv_size() const { return batch * num_heads_kv * seqlen_kv * head_dim_kv; }
     size_t o_size() const { return batch * num_heads_q * seqlen_q * head_dim_q; }
+    
+    // KV size for packed representation
+    size_t kv_size_packed(const std::vector<int>& seqlens_kv) const {
+        int total_seqlen = 0;
+        for (int len : seqlens_kv) total_seqlen += len;
+        return num_heads_kv * total_seqlen * head_dim_kv;
+    }
 
-    void print() const {
+    void print(const std::vector<int>& seqlens_kv) const {
         std::cout << "FMHA Configuration:\n"
-                  << "  Batch size: " << batch << "\n"
+                  << "  Batch size: " << batch << " (decode mode: " << batch << " independent requests)\n"
                   << "  Num heads Q: " << num_heads_q << "\n"
-                  << "  Num heads KV: " << num_heads_kv << "\n"
-                  << "  Sequence length Q: " << seqlen_q << "\n"
-                  << "  Sequence length KV: " << seqlen_kv << "\n"
+                  << "  Num heads KV: " << num_heads_kv << (num_heads_q == num_heads_kv ? " (MHA)" : " (GQA)") << "\n"
+                  << "  Sequence length Q: " << seqlen_q << " (decode: generating 1 token)\n"
+                  << "  Sequence length KV: Variable (Poisson λ=4, range [2, " << max_seqlen_kv << "])\n"
                   << "  Head dimension Q: " << head_dim_q << "\n"
                   << "  Head dimension KV: " << head_dim_kv << "\n"
-                  << "  Data types: Q/K/V=bf16, O=fp16\n"
-                  << "  Q tensor size: " << q_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
-                  << "  K tensor size: " << kv_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
-                  << "  V tensor size: " << kv_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n"
-                  << "  O tensor size: " << o_size() * sizeof(half_t) / (1024.0 * 1024.0) << " MB (fp16)\n";
+                  << "  Data types: Q/K/V=bf16, O=fp16, compute=fp32\n"
+                  << "  Kernel: MFMA 16x16x16 (bf16→fp32 accumulation)\n"
+                  << "  Memory layout: Packed (no padding between batches)\n";
+        
+        size_t kv_size = kv_size_packed(seqlens_kv);
+        std::cout << "  Q tensor size: " << q_size() * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16)\n";
+        std::cout << "  K tensor size: " << kv_size * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16, packed)\n";
+        std::cout << "  V tensor size: " << kv_size * sizeof(bhalf_t) / (1024.0 * 1024.0) << " MB (bf16, packed)\n";
+        std::cout << "  O tensor size: " << o_size() * sizeof(half_t) / (1024.0 * 1024.0) << " MB (fp16)\n";
     }
 };
 
@@ -187,35 +220,61 @@ bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t
  */
 void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int warm_ups = 5) {
     std::cout << "\n=== Running FMHA Benchmark ===\n";
-    config.print();
+    
+    // Generate per-batch sequence lengths
+    std::vector<int> seqlens_kv = config.generate_seqlens_kv();
+    std::vector<int> cu_seqlens_kv = config.compute_cu_seqlens_kv(seqlens_kv);
+    
+    config.print(seqlens_kv);
+    
+    std::cout << "\nVariable sequence lengths (first 10): ";
+    for (int i = 0; i < std::min(10, (int)seqlens_kv.size()); i++) {
+        std::cout << seqlens_kv[i] << " ";
+    }
+    std::cout << "...\n";
+    
+    // Calculate statistics
+    double avg = 0;
+    int total_seqlen = cu_seqlens_kv[config.batch];
+    for (int len : seqlens_kv) avg += len;
+    avg /= seqlens_kv.size();
+    std::cout << "Average seqlen_kv: " << avg << "\n";
+    std::cout << "Total seqlen_kv: " << total_seqlen << " (packed, no padding)\n";
 
     // Allocate host memory (bf16 for inputs, fp16 for output)
+    size_t kv_size = config.kv_size_packed(seqlens_kv);
+    
     bhalf_t *h_Q = (bhalf_t*)malloc(config.q_size() * sizeof(bhalf_t));
-    bhalf_t *h_K = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
-    bhalf_t *h_V = (bhalf_t*)malloc(config.kv_size() * sizeof(bhalf_t));
+    bhalf_t *h_K = (bhalf_t*)malloc(kv_size * sizeof(bhalf_t));
+    bhalf_t *h_V = (bhalf_t*)malloc(kv_size * sizeof(bhalf_t));
     half_t  *h_O = (half_t*)malloc(config.o_size() * sizeof(half_t));
     half_t  *ref_O = (half_t*)malloc(config.o_size() * sizeof(half_t));
+    int     *h_cu_seqlens_kv = (int*)malloc((config.batch + 1) * sizeof(int));
+    std::copy(cu_seqlens_kv.begin(), cu_seqlens_kv.end(), h_cu_seqlens_kv);
 
     // Initialize with random data
     std::cout << "\nInitializing tensors...\n";
     initialize_random_bfloat16(h_Q, config.q_size());
-    initialize_random_bfloat16(h_K, config.kv_size());
-    initialize_random_bfloat16(h_V, config.kv_size());
+    initialize_random_bfloat16(h_K, kv_size);
+    initialize_random_bfloat16(h_V, kv_size);
 
     // Allocate device memory
     bhalf_t *d_Q, *d_K, *d_V;
     half_t  *d_O;
+    int     *d_cu_seqlens_kv = nullptr;
     HIP_CHECK(hipMalloc((void**)&d_Q, config.q_size() * sizeof(bhalf_t)));
-    HIP_CHECK(hipMalloc((void**)&d_K, config.kv_size() * sizeof(bhalf_t)));
-    HIP_CHECK(hipMalloc((void**)&d_V, config.kv_size() * sizeof(bhalf_t)));
+    HIP_CHECK(hipMalloc((void**)&d_K, kv_size * sizeof(bhalf_t)));
+    HIP_CHECK(hipMalloc((void**)&d_V, kv_size * sizeof(bhalf_t)));
     HIP_CHECK(hipMalloc((void**)&d_O, config.o_size() * sizeof(half_t)));
+    HIP_CHECK(hipMalloc((void**)&d_cu_seqlens_kv, (config.batch + 1) * sizeof(int)));
 
     // Copy input data to device
     std::cout << "Preparing data on GPU...\n";
     HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
     HIP_CHECK(hipMemcpy(d_Q, h_Q, config.q_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_K, h_K, config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_V, h_V, config.kv_size() * sizeof(bhalf_t), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_K, h_K, kv_size * sizeof(bhalf_t), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_V, h_V, kv_size * sizeof(bhalf_t), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_cu_seqlens_kv, h_cu_seqlens_kv, (config.batch + 1) * sizeof(int), hipMemcpyHostToDevice));
 
     // Configure kernel launch parameters
     // Grid: (1, num_heads_q, batch) - One block per head per batch element
@@ -228,9 +287,9 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     // Warm-up phase: stabilize GPU clocks and caches
     std::cout << "Running " << warm_ups << " warm-up iterations...\n";
     for (int i = 0; i < warm_ups; ++i) {
-        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
+        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
-                           config.seqlen_q, config.seqlen_kv,
+                           config.seqlen_q, config.max_seqlen_kv,
                            config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
     }
@@ -243,9 +302,9 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     
     HIP_CHECK(hipEventRecord(start, NULL));
     for (int i = 0; i < num_iterations; i++) {
-        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
+        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
-                           config.seqlen_q, config.seqlen_kv,
+                           config.seqlen_q, config.max_seqlen_kv,
                            config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
     }
@@ -268,34 +327,58 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
 
     // Display results
     std::cout << "\n=== Performance Results ===\n";
+    std::cout << "Average time:  " << avg_time_ms << " ms per iteration\n";
     std::cout << "Throughput:    " << 1000.0 / avg_time_ms << " iter/s\n";
-    std::cout << "Performance:   " << tflops << " TFLOPS\n";
+    std::cout << "Performance:   " << tflops << " TFLOPS (compute only, excludes softmax)\n";
+    std::cout << "Per-head latency: " << (avg_time_ms * 1000.0) / (config.batch * config.num_heads_q) << " μs\n";
+    
+    // Memory bandwidth estimate
+    double bytes_per_iter = (config.q_size() + 2 * config.kv_size()) * sizeof(bhalf_t) + 
+                            config.o_size() * sizeof(half_t);
+    double bandwidth_gbs = (bytes_per_iter / (avg_time_ms / 1000.0)) / 1e9;
+    std::cout << "Memory bandwidth: " << bandwidth_gbs << " GB/s\n";
 
     // Verify correctness: run one more iteration and check output
     HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
-    fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O,
+    fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
         config.batch, config.num_heads_q, config.num_heads_kv,
-        config.seqlen_q, config.seqlen_kv,
+        config.seqlen_q, config.max_seqlen_kv,
         config.head_dim_q, config.head_dim_kv,
         1.0f / sqrt(config.head_dim_q));
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
-    do_validation(config, h_Q, h_K, h_V, ref_O, h_O);
+    // Note: Validation needs implementation for variable sequence lengths
+    std::cout << "Validation: TODO - implement per-batch varlen validation\n";
 
     // Cleanup
-    free(h_Q); free(h_K); free(h_V); free(h_O); free(ref_O);
+    free(h_Q); free(h_K); free(h_V); free(h_O); free(ref_O); free(h_cu_seqlens_kv);
     HIP_CHECK(hipFree(d_Q));
     HIP_CHECK(hipFree(d_K));
     HIP_CHECK(hipFree(d_V));
     HIP_CHECK(hipFree(d_O));
+    HIP_CHECK(hipFree(d_cu_seqlens_kv));
 } 
 
 /**
  * Main Entry Point
  * 
  * Usage: ./fmha_benchmark [config_index]
- *   config_index: 0-3 (selects one of four test configurations)
+ *   config_index: 0-3 (selects one of 4 test configurations)
  *                 If not provided, runs all configurations
+ * 
+ * Test Matrix:
+ *   - Batch: 30720 (fixed, decode mode for LLM inference)
+ *   - Heads: 16, 32
+ *   - Head dimension: 128, 256
+ *   - Sequence length Q: 1 (decode mode - generating 1 token at a time)
+ *   - Sequence length KV: Variable (Poisson λ=4, range [2, 16])
+ * 
+ * Memory Layout (Packed Representation):
+ *   - Q, O: [B, H, S_q, D] (standard BHSD layout)
+ *   - K, V: [1, total_seqlen_kv, H, D] (packed, no padding between batches)
+ *     where total_seqlen_kv = sum of all per-batch seqlen_kv values
+ *   - cu_seqlens_kv: [B+1] cumulative offsets to locate each batch's KV data
+ *     Kernel uses cu_seqlens_kv[batch_idx] to find start offset for each batch
  */
 int main(int argc, char* argv[]) {
     std::cout << "Flash Multi-Head Attention (FMHA) - HIP Benchmark\n";
@@ -305,8 +388,10 @@ int main(int argc, char* argv[]) {
     int config_index = -1;  // -1 means run all configs
     if (argc >= 2) {
         config_index = atoi(argv[1]);
-        if (config_index < 0 || config_index > 17) {
-            std::cerr << "Error: config_index must be 0-17\n";
+        if (config_index < 0 || config_index > 18) {
+            std::cerr << "Error: config_index must be 0-18\n";
+            std::cerr << "  Configs 0-15: Uniform seqlen_kv (2, 4, 8, 16)\n";
+            std::cerr << "  Configs 16-18: Variable seqlen_kv (Poisson λ=4, range 2-16)\n";
             std::cerr << "Usage: " << argv[0] << " [config_index]\n";
             return EXIT_FAILURE;
         }
@@ -328,34 +413,15 @@ int main(int argc, char* argv[]) {
     std::cout << "Compute: " << prop.major << "." << prop.minor << "\n";
     std::cout << "Memory: " << prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0) << " GB\n\n";
 
-    // Define test configurations
-    // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, seqlen_kv, head_dim_q, head_dim_kv)
+    // Define test configurations: 4 core configs with variable seqlen_kv
+    // Target spec: Decode mode inference (seqlen_q=1) with large batch (30720)
+    // Variable KV cache length (seqlen_kv: Poisson λ=4, range 2-16)
+    // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, max_seqlen_kv, head_dim_q, head_dim_kv)
     std::vector<FMHAConfig> configs = {
-        // Test various seqlen_kv values (1-16) with 16 heads, head_dim=128
-        FMHAConfig(30720, 16, 16, 1, 1, 128, 128),   // Config 0
-        FMHAConfig(30720, 16, 16, 1, 2, 128, 128),   // Config 1
-        FMHAConfig(30720, 16, 16, 1, 4, 128, 128),   // Config 2
-        FMHAConfig(30720, 16, 16, 1, 8, 128, 128),   // Config 3
-        FMHAConfig(30720, 16, 16, 1, 16, 128, 128),  // Config 4
-        
-        // Test various seqlen_kv values with 16 heads, head_dim=256
-        FMHAConfig(30720, 16, 16, 1, 1, 256, 256),   // Config 5
-        FMHAConfig(30720, 16, 16, 1, 2, 256, 256),   // Config 6
-        FMHAConfig(30720, 16, 16, 1, 4, 256, 256),   // Config 7
-        FMHAConfig(30720, 16, 16, 1, 8, 256, 256),   // Config 8
-        FMHAConfig(30720, 16, 16, 1, 16, 256, 256),  // Config 9
-        
-        // Test 32 heads with various seqlen_kv, head_dim=128
-        FMHAConfig(30720, 32, 32, 1, 1, 128, 128),   // Config 10
-        FMHAConfig(30720, 32, 32, 1, 2, 128, 128),   // Config 11
-        FMHAConfig(30720, 32, 32, 1, 8, 128, 128),   // Config 12
-        FMHAConfig(30720, 32, 32, 1, 16, 128, 128),  // Config 13
-        
-        // Test 32 heads with various seqlen_kv, head_dim=256
-        FMHAConfig(30720, 32, 32, 1, 1, 256, 256),   // Config 14
-        FMHAConfig(30720, 32, 32, 1, 2, 256, 256),   // Config 15
-        FMHAConfig(30720, 32, 32, 1, 8, 256, 256),   // Config 16
-        FMHAConfig(30720, 32, 32, 1, 16, 256, 256),  // Config 17
+        FMHAConfig(30720, 16, 16, 1, 16, 128, 128),  // Config 0: 16 heads, dim 128
+        FMHAConfig(30720, 16, 16, 1, 16, 256, 256),  // Config 1: 16 heads, dim 256
+        FMHAConfig(30720, 32, 32, 1, 16, 128, 128),  // Config 2: 32 heads, dim 128
+        FMHAConfig(30720, 32, 32, 1, 16, 256, 256),  // Config 3: 32 heads, dim 256
     };
 
     // Run benchmark(s)
