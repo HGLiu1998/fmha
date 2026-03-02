@@ -136,14 +136,14 @@ void fmha_mfma(
     }
     __syncthreads();
 
-    /** 
+    
     if (tid == 0 && head_idx == 0 && batch_idx == 0)  {
         printf("\nSoftmax %d:\n", tid);
         for (int i = 0 ; i < seqlen_kv; i++) {
             printf("%f, ", (float)softmax_scores[i]);
         }
         printf("\n");
-    }*/
+    }
 
 
     for (int d = 0; d < CEIL_DIV(head_dim_q, BK); d += 1) {
