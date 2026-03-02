@@ -79,8 +79,8 @@ void fmha_mfma(
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
 
-    for (int k = 0; k < CEIL_DIV(head_dim_q, 64); k += 1) {
-        const uint warp_idx = k * 64 + warp_id * 16;
+    for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
+        const uint warp_idx = warp_id * 16;
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
         const uint bRegLoc = lane_row * 4 + lane_col * kv_stride;
         if (warp_idx + aRegLoc < head_dim_q) {
@@ -91,19 +91,32 @@ void fmha_mfma(
         }
 
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-
-        if ( tid == 0 && head_idx == 0 && batch_idx == 0)  {
-            printf("Testing\n");
-            printf("A: %f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
-            printf("B: %f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
-            printf("Acc: %f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
-        }
-
     }
 
-    
+    // Write MFMA results to scores shared memory
+    // MFMA output layout for f32_16x16x16bf16_1k:
+    // - 64 threads compute 16x16 = 256 output elements
+    // - Each thread holds 4 FP32 outputs in acc[0:4]
+    // - Thread with (lane_row, lane_col) holds:
+    //   acc[i] = C[lane_row*4 + i, lane_col] for i in 0..3
+    //
+    // For decode mode (seqlen_q=1), we only need row 0 of the output
+    // Row 0 is held by threads with lane_row=0 (threads 0-15):
+    //   - acc[0] contains C[0, lane_col]
+    //   - acc[1:3] contain C[1:4, lane_col] (unused for decode mode)
+    if (lane_row == 0 && lane_col < seqlen_kv) {
+        scores[lane_col] = acc[0];  // Only first element holds row 0
+    }
 
     __syncthreads();
+    
+    if (tid == 0 && head_idx == 0 && batch_idx == 0) {
+        printf("GPU Scores (seqlen_kv=%d): ", seqlen_kv);
+        for (int i = 0; i < seqlen_kv; ++i) {
+            printf("%f ", scores[i]);
+        }
+        printf("\n");
+    }
 
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;
