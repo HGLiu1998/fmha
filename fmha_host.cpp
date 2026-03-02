@@ -134,76 +134,147 @@ void initialize_random_bfloat16(bhalf_t* mat, int N) {
     }
 }
 
-bool do_validation(const FMHAConfig& config, bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, half_t *ref_O, half_t *h_O)
+/**
+ * CPU Reference Implementation for Variable-Length FMHA
+ * 
+ * Validates GPU output against CPU computation using packed K/V layout.
+ * K/V layout: [1, total_seqlen_kv, H, D] where sequences are packed without padding
+ * 
+ * @param config Configuration parameters
+ * @param seqlens_kv Per-batch actual sequence lengths [B]
+ * @param cu_seqlens_kv Cumulative sequence offsets [B+1]
+ * @param h_Q Query tensor (host): [B, H_q, S_q, D]
+ * @param h_K Key tensor (host, packed): [1, total_seqlen_kv, H_kv, D]
+ * @param h_V Value tensor (host, packed): [1, total_seqlen_kv, H_kv, D]
+ * @param ref_O Reference output (computed): [B, H_q, S_q, D]
+ * @param h_O GPU output (to validate): [B, H_q, S_q, D]
+ */
+bool do_validation(const FMHAConfig& config, 
+                   const std::vector<int>& seqlens_kv,
+                   const std::vector<int>& cu_seqlens_kv,
+                   bhalf_t *h_Q, bhalf_t *h_K, bhalf_t *h_V, 
+                   half_t *ref_O, half_t *h_O)
 {
-   // std::cout << "start validation" << std::endl;
-
     float scores[16] = {0};
     bool res = true;
+    int num_errors = 0;
+    const int max_errors_to_print = 5;
 
     for (int b = 0; b < config.batch; b++) {
+        // Get this batch's actual seqlen_kv and KV offset
+        const int batch_seqlen_kv = seqlens_kv[b];
+        const int kv_offset = cu_seqlens_kv[b];  // Start position in packed KV
+        const int kv_stride = config.num_heads_kv * config.head_dim_kv;  // Stride for packed layout
+        
         for (int h = 0; h < config.num_heads_q; h++) {
             // Step 1: Compute Q @ K^T scores for this head
-            for (int s = 0; s < config.seqlen_kv; s++) {
+            // Q layout: [B, H_q, S_q, D] - standard BHSD
+            // K layout (packed): [1, total_seqlen_kv, H_kv, D]
+            for (int s = 0; s < batch_seqlen_kv; s++) {
                 float sum = 0;
                 for (int d = 0; d < config.head_dim_q; d++) {
-                    bhalf_t q = h_Q[b * config.seqlen_q * config.head_dim_q * config.num_heads_q + h * config.seqlen_q * config.head_dim_q + d];
-                    bhalf_t k = h_K[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s * config.head_dim_kv + d];  
-                    sum += (float)q * (float)k;                 
+                    // Q index: [b, h, 0, d] (seqlen_q=1 for decode)
+                    size_t q_idx = (size_t)b * config.num_heads_q * config.seqlen_q * config.head_dim_q
+                                 + (size_t)h * config.seqlen_q * config.head_dim_q
+                                 + d;
+                    bhalf_t q = h_Q[q_idx];
+                    
+                    // K index (packed): [kv_offset + s, h, d]
+                    // Layout: [seqlen, head, dim] with stride = num_heads_kv * head_dim_kv
+                    size_t k_idx = (size_t)(kv_offset + s) * kv_stride
+                                 + (size_t)h * config.head_dim_kv
+                                 + d;
+                    bhalf_t k = h_K[k_idx];
+                    
+                    sum += (float)q * (float)k;
                 }
                 scores[s] = sum;
             }
-            if (h == 0 && b == 0)  {
-                printf("Scores: ");
-                for (int i = 0; i < config.seqlen_kv; ++i) {
+            
+            // Debug: Print scores for first batch/head
+            if (h == 0 && b == 0) {
+                printf("CPU Validation - Scores (batch 0, head 0, seqlen_kv=%d): ", batch_seqlen_kv);
+                for (int i = 0; i < batch_seqlen_kv; ++i) {
                     printf("%f ", scores[i]);
                 }
                 printf("\n");
             }
-            for (int s = 0; s < config.seqlen_kv; s++) {
+            
+            // Apply softmax scale
+            for (int s = 0; s < batch_seqlen_kv; s++) {
                 scores[s] *= (1.0f / sqrtf(config.head_dim_q));
             }
 
-            // Step 2: Softmax + P @ V for this head
+            // Step 2: Softmax
             bhalf_t softmax_scores[16] = {0};
             float maxVal = -INFINITY;
-            float sumExp = 0.0f;
-            for (int s = 0; s < config.seqlen_kv; s++) {
+            for (int s = 0; s < batch_seqlen_kv; s++) {
                 maxVal = fmaxf(maxVal, scores[s]);
             }
-            for (int s = 0; s < config.seqlen_kv; s++) {
+            float sumExp = 0.0f;
+            for (int s = 0; s < batch_seqlen_kv; s++) {
                 sumExp += expf(scores[s] - maxVal);
             }
-            for (int s = 0; s < config.seqlen_kv; s++) {
+            for (int s = 0; s < batch_seqlen_kv; s++) {
                 softmax_scores[s] = static_cast<bhalf_t>(expf(scores[s] - maxVal) / sumExp);
             }
+            
+            // Step 3: P @ V (attention-weighted sum)
+            // V layout (packed): [1, total_seqlen_kv, H_kv, D]
             for (int d = 0; d < config.head_dim_q; d++) {
                 float sum = 0;
-                for (int s = 0; s < config.seqlen_kv; s++) {
-                    sum += (float)(softmax_scores[s] * (float)h_V[b * config.seqlen_kv * config.head_dim_kv * config.num_heads_kv + h * config.seqlen_kv * config.head_dim_kv + s + d * config.seqlen_kv]);
+                for (int s = 0; s < batch_seqlen_kv; s++) {
+                    // V index (packed): [kv_offset + s, h, d]
+                    size_t v_idx = (size_t)(kv_offset + s) * kv_stride
+                                 + (size_t)h * config.head_dim_kv
+                                 + d;
+                    sum += (float)softmax_scores[s] * (float)h_V[v_idx];
                 }
-                ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + d] = static_cast<half_t>(sum);
+                // O index: [b, h, 0, d] (seqlen_q=1)
+                size_t o_idx = (size_t)b * config.num_heads_q * config.seqlen_q * config.head_dim_q
+                             + (size_t)h * config.seqlen_q * config.head_dim_q
+                             + d;
+                ref_O[o_idx] = static_cast<half_t>(sum);
             }
         }
 
-        // Step 3: Validate this batch element
+        // Step 4: Validate this batch element
         for (int h = 0; h < config.num_heads_q; h++) {
-            for (int s = 0; s < config.seqlen_q; s++) {
+            for (int s = 0; s < config.seqlen_q; s++) {  // Always 1 for decode
                 for (int d = 0; d < config.head_dim_q; d++) {
-                    double o = (float)h_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
-                    double r = (float)ref_O[b * config.num_heads_q * config.seqlen_q * config.head_dim_q + h * config.seqlen_q * config.head_dim_q + s * config.head_dim_q + d];
+                    size_t idx = (size_t)b * config.num_heads_q * config.seqlen_q * config.head_dim_q
+                               + (size_t)h * config.seqlen_q * config.head_dim_q
+                               + (size_t)s * config.head_dim_q
+                               + d;
+                    double o = (float)h_O[idx];
+                    double r = (float)ref_O[idx];
                     double err = std::abs(o - r);
+                    
+                    // Relative error tolerance: 1e-2 (1%)
                     if (err > 1e-2 + 1e-2 * std::abs(r)) {
-                        //std::cout << "Error! out " << o << " != ref " << r << std::endl;
+                        if (num_errors < max_errors_to_print) {
+                            std::cout << "Error at [b=" << b << ",h=" << h << ",s=" << s << ",d=" << d 
+                                      << "]: GPU=" << o << " CPU=" << r << " err=" << err << std::endl;
+                        }
+                        num_errors++;
                         res = false;
                     }
                 }
             }
         }
     }
-    if (res) std::cout << "Validation success!" << std::endl;
+    
+    if (res) {
+        std::cout << "✓ Validation passed!" << std::endl;
+    } else {
+        std::cout << "✗ Validation failed: " << num_errors << " errors found";
+        if (num_errors > max_errors_to_print) {
+            std::cout << " (showing first " << max_errors_to_print << ")";
+        }
+        std::cout << std::endl;
+    }
+    
     return res;
-
 }
 /**
  * FMHA Benchmark Runner
@@ -319,10 +390,22 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
 
     double avg_time_ms = elapsed_ms / num_iterations;
     
-    // Estimate FLOPs: 2 matmuls (Q@K^T and P@V), each MAC = 2 FLOPs
-    // Note: Doesn't include softmax ops (exp, div)
-    long long flops_per_iter = 4LL * config.batch * config.num_heads_q *
-                               config.seqlen_q * config.seqlen_kv * config.head_dim_q;
+    // Calculate actual compute work for variable-length sequences
+    // Total seqlen_kv across all batches
+    double avg_seqlen_kv = avg;  // Already computed above
+    long long total_seqlen_kv = total_seqlen;  // Already computed above
+    
+    // Estimate FLOPs for variable-length FMHA:
+    // - Q@K^T: For each (batch, head, query_token), compute dot product with seqlen_kv keys
+    //   FLOPs = batch * num_heads * seqlen_q * seqlen_kv * head_dim * 2 (MAC = 2 FLOPs)
+    // - P@V: For each (batch, head, query_token, output_dim), weighted sum over seqlen_kv values
+    //   FLOPs = batch * num_heads * seqlen_q * head_dim * seqlen_kv * 2
+    // Total: 4 * batch * num_heads * seqlen_q * seqlen_kv * head_dim
+    //
+    // For variable lengths, we use the actual total work across all batches:
+    // Sum over batches: 4 * num_heads_q * seqlen_q * seqlens_kv[b] * head_dim_q
+    long long flops_per_iter = 4LL * config.num_heads_q * config.seqlen_q * 
+                               total_seqlen_kv * config.head_dim_q;
     double tflops = (flops_per_iter / (avg_time_ms / 1000.0)) / 1e12;
 
     // Display results
@@ -330,15 +413,20 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     std::cout << "Average time:  " << avg_time_ms << " ms per iteration\n";
     std::cout << "Throughput:    " << 1000.0 / avg_time_ms << " iter/s\n";
     std::cout << "Performance:   " << tflops << " TFLOPS (compute only, excludes softmax)\n";
-    std::cout << "Per-head latency: " << (avg_time_ms * 1000.0) / (config.batch * config.num_heads_q) << " μs\n";
+    std::cout << "Avg seqlen_kv: " << avg_seqlen_kv << " (used for FLOPs: " 
+              << flops_per_iter << ")\n";
+    std::cout << "Per-head latency: " << (avg_time_ms * 1000.0) / (config.batch * config.num_heads_q) 
+              << " μs\n";
     
-    // Memory bandwidth estimate
-    double bytes_per_iter = (config.q_size() + 2 * config.kv_size()) * sizeof(bhalf_t) + 
-                            config.o_size() * sizeof(half_t);
+    // Memory bandwidth estimate (uses actual packed KV size)
+    double bytes_per_iter = (config.q_size() * sizeof(bhalf_t)) +
+                            (2 * kv_size * sizeof(bhalf_t)) +  // K + V (packed)
+                            (config.o_size() * sizeof(half_t));
     double bandwidth_gbs = (bytes_per_iter / (avg_time_ms / 1000.0)) / 1e9;
-    std::cout << "Memory bandwidth: " << bandwidth_gbs << " GB/s\n";
+    std::cout << "Memory bandwidth: " << bandwidth_gbs << " GB/s (actual data transferred)\n";
 
     // Verify correctness: run one more iteration and check output
+    std::cout << "\n=== Validation ===\n";
     HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
     fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
         config.batch, config.num_heads_q, config.num_heads_kv,
@@ -347,8 +435,8 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
         1.0f / sqrt(config.head_dim_q));
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
-    // Note: Validation needs implementation for variable sequence lengths
-    std::cout << "Validation: TODO - implement per-batch varlen validation\n";
+    // Validate GPU output against CPU reference
+    do_validation(config, seqlens_kv, cu_seqlens_kv, h_Q, h_K, h_V, ref_O, h_O);
 
     // Cleanup
     free(h_Q); free(h_K); free(h_V); free(h_O); free(ref_O); free(h_cu_seqlens_kv);
