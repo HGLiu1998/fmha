@@ -28,7 +28,6 @@ void fmha_mfma(
     const int num_heads_q,
     const int num_heads_kv,
     const int seqlen_q,                    // always 1 (decode)
-    const int seqlen_kv_max,               // maximum seqlen_kv (for bounds checking)
     const int head_dim_q,                  // 128 or 256
     const int head_dim_kv,
     const float softmax_scale)
@@ -54,7 +53,7 @@ void fmha_mfma(
     // Offset: skip to this batch's sequences, then to this head
     // Layout: [seqlen, head, dim] so stride is head_dim_kv, then num_heads_kv * head_dim_kv
     const size_t kv_offset = (size_t)seqlen_start * num_heads_kv * head_dim_kv  // skip previous batches
-                           + (size_t)head_idx * head_dim_kv;                     // skip to this head
+                            + head_idx * head_dim_kv;
 
     // ========================================================================
     // Adjust Pointers to This Batch + Head
@@ -74,39 +73,31 @@ void fmha_mfma(
     __shared__ __attribute__((aligned(128))) bhalf_t softmax_scores[256];
 
     scores[tid] = 0.0f;
+    softmax_scores[tid] = 0.0f;
     __syncthreads();
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
 
-    for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
-        const uint warp_idx = warp_id * 16;
-        const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
-        const uint bRegLoc = lane_row * 4 + lane_col * kv_stride;
-        if (warp_idx + aRegLoc < head_dim_q) {
-            a = *(bf16x4*)(&Q_ptr[warp_idx + aRegLoc]);
-        }
-        if (warp_idx + bRegLoc < seqlen_kv * kv_stride) {
-            b = *(bf16x4*)(&K_ptr[warp_idx + bRegLoc]);
+    if (warp_id == 0) {
+        for (int k = 0; k < CEIL_DIV(head_dim_q, 16); k += 1) {
+            const uint dim_idx = k * 16;
+            const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
+            const uint bRegLoc = lane_row * 4 + lane_col * kv_stride;
+            if (dim_idx + aRegLoc < head_dim_q) {
+                a = *(bf16x4*)(&Q_ptr[dim_idx + aRegLoc]);
+            }
+            if (dim_idx + bRegLoc < seqlen_kv * kv_stride) {
+                b = *(bf16x4*)(&K_ptr[dim_idx + bRegLoc]);
+            }
+
+            acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
         }
 
-        acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-    }
-
-    // Write MFMA results to scores shared memory
-    // MFMA output layout for f32_16x16x16bf16_1k:
-    // - 64 threads compute 16x16 = 256 output elements
-    // - Each thread holds 4 FP32 outputs in acc[0:4]
-    // - Thread with (lane_row, lane_col) holds:
-    //   acc[i] = C[lane_row*4 + i, lane_col] for i in 0..3
-    //
-    // For decode mode (seqlen_q=1), we only need row 0 of the output
-    // Row 0 is held by threads with lane_row=0 (threads 0-15):
-    //   - acc[0] contains C[0, lane_col]
-    //   - acc[1:3] contain C[1:4, lane_col] (unused for decode mode)
-    if (lane_row == 0 && lane_col < seqlen_kv) {
-        scores[lane_col] = acc[0];  // Only first element holds row 0
-    }
+        if (lane_row == 0 && lane_col < seqlen_kv) {
+            scores[lane_col] = acc[0];  // Only first element holds row 0
+        }
+    }   
 
     __syncthreads();
     
@@ -121,27 +112,35 @@ void fmha_mfma(
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;
     }
-    // Step 1: Find global max
+
+    __syncthreads();
+
+    // Step 1: Find global max across all threads
     float maxVal = -INFINITY;
     if (tid < seqlen_kv) {
         maxVal = scores[tid];
     }
-    // Reduce max across threads
-    for (int i = 8; i > 0; i /= 2) {
-        maxVal = fmaxf(maxVal, __shfl_xor(maxVal, i));
+
+    // Reduce max within warp (64 threads on AMD)
+    for (int offset = 8; offset > 0; offset /= 2) {
+        maxVal = fmaxf(maxVal, __shfl_xor(maxVal, offset, 16));
     }
+
     // Step 2: Compute exp and sum
     float sumExp = 0.0f;
     if (tid < seqlen_kv) {
         scores[tid] = expf(scores[tid] - maxVal);
         sumExp = scores[tid];
     }
-    for (int i = 8; i > 0; i /= 2) {
-        sumExp += __shfl_xor(sumExp, i);
+
+    // Reduce sum within warp
+    for (int offset = 8; offset > 0; offset /= 2) {
+        sumExp += __shfl_xor(sumExp, offset, 16);
     }
+    // Step 3: Normalize
     if (tid < seqlen_kv) {
         scores[tid] /= sumExp;
-        softmax_scores[tid] = static_cast<__bf16>(scores[tid]); 
+        softmax_scores[tid] = static_cast<__bf16>(scores[tid]);
     }
     if (tid >= seqlen_kv && tid < 16) {
         softmax_scores[tid] = static_cast<__bf16>(0.0f);
@@ -153,33 +152,22 @@ void fmha_mfma(
         b = {0};
         acc = {0};
         const uint dim_idx = d * BK + warp_id * 16;
-        const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
-        const uint bRegLoc = lane_row * 4 + lane_col * seqlen_kv;
-        if (lane_col == 0) {
-            a = *(bf16x4*)(&softmax_scores[aRegLoc]);
-        }
-        if (dim_idx + lane_col < head_dim_kv) {
-            // Access V with packed layout: V[s, h, d]
-            // Stride between sequences is (num_heads_kv * head_dim_kv)
-            if (lane_row * 4 + 4 <= seqlen_kv) {
-                const size_t v_idx = (lane_row * 4) * kv_stride + (dim_idx + lane_col);
-                b = *(bf16x4*)(&V_ptr[v_idx]);
-            } else {
-                for (int i = 0; i < 4; i++) {
-                    int s = lane_row * 4 + i;
-                    if (s < seqlen_kv) {
-                        const size_t v_idx = s * kv_stride + (dim_idx + lane_col);
-                        b[i] = V_ptr[v_idx];
-                    }
-                }
+
+        // Load A (softmax scores): [1, seqlen_kv]
+        const uint aRegLoc = lane_row * 4 + lane_col * 16;
+        a = *(bf16x4*)(&softmax_scores[aRegLoc]);
+        
+        for (int i = 0; i < 4; ++i) {
+            const uint bRegLoc = lane_row * 4 * kv_stride + lane_col + dim_idx;
+            if (lane_row * 4 + i < seqlen_kv) {
+                b[i] = V_ptr[bRegLoc + i * kv_stride];
             }
         }
         acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-        for (int i = 0; i < 4; ++i) {
-            const uint cRegLoc = (lane_row * 4 + i) * head_dim_q + lane_col + dim_idx; 
-            if (cRegLoc < head_dim_q) {
-                O_ptr[cRegLoc] = static_cast<half_t>(acc[i]);
-            }
+
+
+        if (lane_row == 0) {
+            O_ptr[lane_col + dim_idx] = static_cast<half_t>(acc[0]);
         }
         //if ((tid == 64 || tid == 0) && head_idx == 0 && batch_idx == 0)  {
         //    printf("\nAcc %d:\n", tid);
