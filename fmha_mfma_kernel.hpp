@@ -99,16 +99,6 @@ void fmha_mfma(
         }
     }   
 
-    __syncthreads();
-    
-    if (tid == 0 && head_idx == 0 && batch_idx == 0) {
-        printf("GPU Scores (seqlen_kv=%d): ", seqlen_kv);
-        for (int i = 0; i < seqlen_kv; ++i) {
-            printf("%f ", scores[i]);
-        }
-        printf("\n");
-    }
-
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;
     }
@@ -169,12 +159,6 @@ void fmha_mfma(
         if (lane_row == 0) {
             O_ptr[lane_col + dim_idx] = static_cast<half_t>(acc[0]);
         }
-        //if ((tid == 64 || tid == 0) && head_idx == 0 && batch_idx == 0)  {
-        //    printf("\nAcc %d:\n", tid);
-        //    printf("%f, %f, %f, %f\n", (float)a[0], (float)a[1], (float)a[2], (float)a[3]);
-        //    printf("%f, %f, %f, %f\n", (float)b[0], (float)b[1], (float)b[2], (float)b[3]);
-        //    printf("%f, %f, %f, %f\n", (float)acc[0], (float)acc[1], (float)acc[2], (float)acc[3]);
-        //}
 
     }
 }   
