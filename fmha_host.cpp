@@ -360,8 +360,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     for (int i = 0; i < warm_ups; ++i) {
         fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
-                           config.seqlen_q, config.max_seqlen_kv,
-                           config.head_dim_q, config.head_dim_kv,
+                           config.seqlen_q, config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
     }
     HIP_CHECK(hipDeviceSynchronize());
@@ -375,8 +374,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     for (int i = 0; i < num_iterations; i++) {
         fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
-                           config.seqlen_q, config.max_seqlen_kv,
-                           config.head_dim_q, config.head_dim_kv,
+                           config.seqlen_q, config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
     }
     HIP_CHECK(hipEventRecord(end, NULL));
@@ -430,8 +428,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
     fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
         config.batch, config.num_heads_q, config.num_heads_kv,
-        config.seqlen_q, config.max_seqlen_kv,
-        config.head_dim_q, config.head_dim_kv,
+        config.seqlen_q, config.head_dim_q, config.head_dim_kv,
         1.0f / sqrt(config.head_dim_q));
     HIP_CHECK(hipMemcpy(h_O, d_O, config.o_size() * sizeof(half_t), hipMemcpyDeviceToHost));
 
@@ -476,11 +473,8 @@ int main(int argc, char* argv[]) {
     int config_index = -1;  // -1 means run all configs
     if (argc >= 2) {
         config_index = atoi(argv[1]);
-        if (config_index < 0 || config_index > 18) {
-            std::cerr << "Error: config_index must be 0-18\n";
-            std::cerr << "  Configs 0-15: Uniform seqlen_kv (2, 4, 8, 16)\n";
-            std::cerr << "  Configs 16-18: Variable seqlen_kv (Poisson λ=4, range 2-16)\n";
-            std::cerr << "Usage: " << argv[0] << " [config_index]\n";
+        if (config_index < 0 || config_index > 3) {
+            std::cerr << "Error: config_index must be 0-3\n";
             return EXIT_FAILURE;
         }
     }
