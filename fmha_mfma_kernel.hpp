@@ -17,7 +17,7 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
 #define BLOCK_SIZE 256
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 __global__
-__launch_bounds__(256, 1)
+__launch_bounds__(256, 2)
 void fmha_mfma(
     const bhalf_t* __restrict__ Q,         // [B, H_q,  S_q,  D] bf16
     const bhalf_t* __restrict__ K,         // Packed: [1, total_S_kv, H_kv, D]
