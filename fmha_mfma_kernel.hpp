@@ -112,7 +112,7 @@ void fmha_mfma(
                 a = *(bf16x4*)(&Q_ptr[dim_idx + aRegLoc]);
             }
             if (dim_idx + bRegLoc < seqlen_kv * kv_stride) {
-                b = *(bf16x4*)(&K_ptr[dim_idx + bRegLoc]);
+                b = *(bf16x4*)(&KV_lds[dim_idx + bRegLoc]);
             }
 
             acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
