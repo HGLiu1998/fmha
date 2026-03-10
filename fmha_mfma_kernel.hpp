@@ -16,6 +16,12 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
 #define WARP_SIZE 64
 #define BLOCK_SIZE 256
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+#define ASM_DEBUG(maker) \
+    __builtin_amdgcn_sched_barrier(0); \
+    asm volatile(maker);               \
+    __builtin_amdgcn_sched_barrier(0); \
+
 __global__
 __launch_bounds__(256, 2)
 void fmha_mfma(
@@ -85,6 +91,7 @@ void fmha_mfma(
     const int kv_row = tid / threads_per_row;
     const int kv_col = (tid % threads_per_row) * elements_per_thread;
 
+    ASM_DEBUG("Load K to LDS and preload V");
     for (int r = kv_row; r < seqlen_kv; r += rounds) {
         *(bf16x8*)(&KV_lds[r * max_hd_pad + kv_col]) = *(const bf16x8*)(&K_ptr[r * kv_stride + kv_col]);
     }
@@ -102,6 +109,8 @@ void fmha_mfma(
 
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
+
+    ASM_DEBUG("Q @ K^T");
 
     if (warp_id == 0) {
         const uint aRegLoc = lane_row * 4 + lane_col * head_dim_q;
@@ -122,6 +131,9 @@ void fmha_mfma(
             scores[lane_col] = acc[0];  // Only first element holds row 0
         }
     }   
+
+
+    ASM_DEBUG("Softmax");
 
     if (tid < seqlen_kv) {
         scores[tid] *= softmax_scale;
@@ -161,6 +173,9 @@ void fmha_mfma(
     }
     __syncthreads();
 
+    ASM_DEBUG("load V to LDS");
+
+
     if (kv_row < seqlen_kv) {
         *(bf16x8*)(&KV_lds[kv_row * max_hd_pad + kv_col]) = v_reg_0;
     }
@@ -173,6 +188,8 @@ void fmha_mfma(
     const uint aRegLoc = lane_row * 4 + lane_col * 16;
     const uint bRegLoc = lane_row * 4 * max_hd_pad + lane_col;
 
+    
+    ASM_DEBUG("S @ V");
 
     a = *(bf16x4*)(&softmax_scores[aRegLoc]);
 
