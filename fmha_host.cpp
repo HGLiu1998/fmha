@@ -354,7 +354,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     // Configure kernel launch parameters
     // Grid: (1, num_heads_q, batch) - One block per head per batch element
     dim3 gridDim(1, config.num_heads_q, config.batch);
-    dim3 girdDim2(1, 1, config.batch);
+    //dim3 girdDim2(1, 1, config.batch);
     dim3 blockDim(256, 1, 1);
 
     // Create HIP events for timing
@@ -505,7 +505,7 @@ int main(int argc, char* argv[]) {
     // Variable KV cache length (seqlen_kv: Poisson λ=4, range 2-16)
     // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, max_seqlen_kv, head_dim_q, head_dim_kv)
     std::vector<FMHAConfig> configs = {
-        FMHAConfig(100, 16, 16, 1, 16, 128, 128), // Testing
+        FMHAConfig(10, 16, 16, 1, 16, 128, 128), // Testing
         FMHAConfig(30720, 16, 16, 1, 16, 128, 128),  // Config 0: 16 heads, dim 128
         FMHAConfig(30720, 16, 16, 1, 16, 256, 256),  // Config 1: 16 heads, dim 256
         FMHAConfig(30720, 32, 32, 1, 16, 128, 128),  // Config 2: 32 heads, dim 128

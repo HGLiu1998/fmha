@@ -23,7 +23,8 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
     __builtin_amdgcn_sched_barrier(0); \
 
 __global__
-__launch_bounds__(256, 2)
+__attribute__((amdgpu_waves_per_eu(1, 1)))
+__launch_bounds__(256, 1)
 void fmha_mfma(
     const bhalf_t* __restrict__ Q,         // [B, H_q,  S_q,  D] bf16
     const bhalf_t* __restrict__ K,         // Packed: [1, total_S_kv, H_kv, D]
