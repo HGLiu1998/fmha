@@ -505,7 +505,7 @@ int main(int argc, char* argv[]) {
     // Variable KV cache length (seqlen_kv: Poisson λ=4, range 2-16)
     // Format: FMHAConfig(batch, num_heads_q, num_heads_kv, seqlen_q, max_seqlen_kv, head_dim_q, head_dim_kv)
     std::vector<FMHAConfig> configs = {
-        FMHAConfig(1, 16, 16, 1, 16, 128, 128), // Testing
+        FMHAConfig(100, 16, 16, 1, 16, 128, 128), // Testing
         FMHAConfig(30720, 16, 16, 1, 16, 128, 128),  // Config 0: 16 heads, dim 128
         FMHAConfig(30720, 16, 16, 1, 16, 256, 256),  // Config 1: 16 heads, dim 256
         FMHAConfig(30720, 32, 32, 1, 16, 128, 128),  // Config 2: 32 heads, dim 128
