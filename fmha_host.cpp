@@ -15,6 +15,7 @@
 #include <fstream>
 #include "fmha_mfma_kernel.hpp"
 #include "fmha_mfma_coalesced_kernel.hpp"
+#include "fmha_mfma_allwarp_kernel.hpp"
 
 // Type aliases for numeric types
 using bhalf_t = __bf16;      // bfloat16 for Q, K, V
