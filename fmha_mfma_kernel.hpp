@@ -20,6 +20,11 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 #endif
 
+
+#define ASM_DEBUG(maker) \
+    __builtin_amdgcn_sched_barrier(0); \
+    asm volatile(maker);               \
+    __builtin_amdgcn_sched_barrier(0); \
 // ============================================================================
 // MFMA FMHA Kernel — Cooperative K+Q Loading, 2 Barriers
 //
@@ -97,15 +102,7 @@ void fmha_mfma(
     // Zero softmax_scores (each thread writes its own position, no barrier)
     softmax_scores[tid] = static_cast<__bf16>(0.0f);
 
-    // ========================================================================
-    // Phase 1: Cooperative Q + K Loading (ALL 256 threads)
-    //
-    // No pre-zeroing of KV_lds:
-    //   Invalid K rows have garbage → softmax masking handles it.
-    //   K loading is 4x faster with 256 threads vs. 64.
-    // ========================================================================
-
-    // Load Q → Q_lds
+    ASM_DEBUG(";Q load to LDS");
     {
         const int q_vecs = head_dim_q / 8;  // 16 (D=128) or 32 (D=256)
         if (tid < q_vecs) {
@@ -113,7 +110,7 @@ void fmha_mfma(
         }
     }
 
-    // Load K → KV_lds (all 256 threads cooperate)
+    ASM_DEBUG(";K Load to LDS");
     {
         const int threads_per_row = head_dim_q / 8;             // 16 or 32
         const int k_rounds = BLOCK_SIZE / threads_per_row;      // 16 or 8
@@ -125,25 +122,15 @@ void fmha_mfma(
         }
     }
 
-    // ========================================================================
-    // ── Barrier 1 ──
-    // All warps' K+Q LDS writes visible to all warps.
-    // ========================================================================
     __syncthreads();
 
-    // ========================================================================
-    // Phase 2: QK^T + Softmax (warp 0 only)
-    //
-    // Reads K+Q from LDS. Invalid K rows (≥ seqlen_kv) have garbage scores
-    // but softmax masking produces correct weights:
-    //   maxVal: invalid → -INFINITY (neutral for fmaxf)
-    //   exp_val: invalid → 0.0f (neutral for sum)
-    // ========================================================================
+    asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
     floatx4 acc = {0};
     bf16x4 a = {0}, b = {0};
 
+
     if (warp_id == 0) {
-        // ── QK^T (SW-pipelined) ──
+        ASM_DEBUG("; Q @ K^T");
         const int total_tiles = CEIL_DIV(head_dim_q, 16);
         const int last_tile = total_tiles - 1;
 
@@ -165,7 +152,7 @@ void fmha_mfma(
             //__builtin_amdgcn_sched_barrier(0);
         }
 
-        // ── Fused softmax (register-only, warp shuffles) ──
+        ASM_DEBUG("; Softmax");
         float score = acc[0] * softmax_scale;
 
         float maxVal = (lane_col < seqlen_kv) ? score : -INFINITY;
@@ -191,16 +178,8 @@ void fmha_mfma(
     // ========================================================================
     __syncthreads();
 
-    // ========================================================================
-    // Phase 3: V → KV_lds (each warp independently, no barrier needed)
-    //
-    // Each warp: zero ALL KV_lds → load V to valid rows → lgkmcnt(0)
-    //   Within-warp LDS store ordering: zeros issued before V writes.
-    //   After lgkmcnt(0): valid rows = V data, invalid rows = zeros.
-    //   4x redundant HBM V reads hit L2 cache (warm from first warp).
-    // ========================================================================
     {
-        // Zero KV_lds (within-warp, each lane handles ~8 vec8 stores)
+        ASM_DEBUG("; V load to LDS");
         constexpr int total_lds_vec = max_seqlen_kv * max_hd_pad / 8;  // 520
         const bf16x8 zero8 = {0};
         for (int i = lane_id; i < total_lds_vec; i += 64) {
@@ -217,13 +196,10 @@ void fmha_mfma(
                 *(const bf16x8*)(&V_ptr[r * kv_stride + w_col]);
         }
     }
-    // Wait for THIS wavefront's global loads + LDS stores to complete.
-    // No s_barrier needed: each warp reads only its OWN LDS writes.
-    asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
 
-    // ========================================================================
-    // Phase 4: Attn×V via MFMA (all 4 warps, SW-pipelined)
-    // ========================================================================
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+    ASM_DEBUG("; Attn @ V");
     const uint aRegLoc = lane_row * 4 + lane_col * 16;
     const uint bRegLoc = lane_row * 4 * max_hd_pad + lane_col;
 
