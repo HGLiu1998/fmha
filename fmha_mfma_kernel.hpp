@@ -151,7 +151,7 @@ void fmha_mfma(
         bf16x4 b_pre = *(const bf16x4*)(&KV_lds[lane_col * max_hd_pad + lane_row * 4]);
 
         for (int k = 0; k < total_tiles; ++k) {
-            __builtin_amdgcn_sched_barrier(0);
+            //__builtin_amdgcn_sched_barrier(0);
             a = a_pre;
             b = b_pre;
 
@@ -160,9 +160,9 @@ void fmha_mfma(
             a_pre = *(const bf16x4*)(&Q_lds[next_dim + lane_row * 4]);
             b_pre = *(const bf16x4*)(&KV_lds[lane_col * max_hd_pad + next_dim + lane_row * 4]);
 
-            asm volatile("s_waitcnt lgkmcnt(2)\n" ::: "memory");
+            //asm volatile("s_waitcnt lgkmcnt(2)\n" ::: "memory");
             acc = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, acc, 0, 0, 0);
-            __builtin_amdgcn_sched_barrier(0);
+            //__builtin_amdgcn_sched_barrier(0);
         }
 
         // ── Fused softmax (register-only, warp shuffles) ──
