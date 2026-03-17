@@ -26,309 +26,327 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
     __builtin_amdgcn_sched_barrier(0); \
 
 // ============================================================================
-// Multi-Head 4x4x4 MFMA FMHA Kernel (Optimized)
+// Multi-Head 4×4×4 MFMA FMHA Kernel (Method B)
 //
-// 16 heads per block via v_mfma_f32_4x4x4_bf16_1k (16 independent 4x4 blocks).
+// Key idea: use v_mfma_f32_4x4x4_bf16_1k which produces 16 independent
+// 4×4 blocks per wavefront. Each block handles a different HEAD (0-15).
 //
-// Optimizations:
-//   1. COOPERATIVE COALESCED K/V loads (bf16x8, 100% cache line utilization)
-//   2. LDS reads in MFMA loops (~20 cy vs ~400 cy global)
-//   3. SINGLE KV_lds buffer reused for K then V
-//   4. Global fallback for kv_pos beyond LDS capacity (rare, <1% at Poisson l=4)
+// 4×4×4 MFMA register layout:
+//   64 lanes → 16 blocks of 4 lanes each
+//   block_id = lane_id / 4       (0-15, maps to head)
+//   lane_in_block = lane_id % 4  (0-3, maps to kv_pos or dim)
 //
-// LDS layout (runtime-sized KV_lds):
-//   Q_lds[16][260]         -- Q for all heads, stride=260 (max D=256 + pad=4)
-//   scores_lds[256]        -- QK^T scores / softmax weights
-//   KV_lds[28096]          -- K then V (single buffer, 56,192 bytes)
-//     Indexed: KV_lds[seq * kv_seq_stride + head * head_dim_padded + dim]
-//     D=128: head_dim_padded=130, kv_seq_stride=2080, max 13 kv positions
-//     D=256: head_dim_padded=258, kv_seq_stride=4128, max 6 kv positions
+//   A operand: a[0..3] packed bf16x4 (broadcast: all rows identical since seqlen_q=1)
+//   B operand: b[0..3] packed bf16x4 (4 k-elements for this lane's column)
+//   C output:  acc[0..3] = C[0..3, lane_in_block]  (4 rows × 1 col)
 //
-// Bank conflict analysis (KV_PAD=2, D=128):
-//   Same head, diff seq: stride=4160B, 4160/4%32=16 -> NO conflict
-//   Diff head, same seq: stride=260B,  260/4%32=1  -> NO conflict
+// Diagonal extraction: since seqlen_q=1, all rows of A are identical,
+// so all rows of C = A×B are identical. acc[lane_in_block] = C[j][j]
+// gives the correct scalar result for this lane's position.
+//
+// Method B mapping:
+//   block_id (0-15) → HEAD (consistent across ALL phases)
+//   lane_in_block   → kv position (QK^T) or dim within tile (Attn×V)
+//   warp_id (0-3)   → kv chunk (QK^T) or dim range (Attn×V)
+//
+// Memory access pattern:
+//   Q: loaded to Q_lds cooperatively (16 heads × head_dim), broadcast within blocks
+//   K: read directly from global per-lane (each lane has its own head, L1-cached)
+//   V: read directly from global per-lane (same pattern as K)
+//   No KV_lds needed — saves LDS and eliminates 1 barrier
 //
 // Grid: (1, CEIL_DIV(num_heads_q, 16), batch)
-// Barriers: 3
+//   Each block handles UP TO 16 heads.
+//
+// Barrier count: 2
+//   Barrier 1: Q in LDS
+//   Barrier 2: QK^T scores in scores_lds (for softmax + Attn×V)
 // ============================================================================
 
 __global__
 __launch_bounds__(256, 1)
 void fmha_mfma_4x4x4(
-    const bhalf_t* __restrict__ Q,         // [B, H_q, S_q, D]
-    const bhalf_t* __restrict__ K,         // [1, total_S_kv, H_kv, D]
-    const bhalf_t* __restrict__ V,         // [1, total_S_kv, H_kv, D]
-    half_t*        __restrict__ O,         // [B, H_q, S_q, D]
-    const int* __restrict__ cu_seqlens_kv, // [B+1]
+    const bhalf_t* __restrict__ Q,         // [B, H_q,  S_q,  D] bf16
+    const bhalf_t* __restrict__ K,         // Packed: [1, total_S_kv, H_kv, D]
+    const bhalf_t* __restrict__ V,         // Packed: [1, total_S_kv, H_kv, D]
+    half_t*        __restrict__ O,         // [B, H_q,  S_q,  D] fp16
+    const int* __restrict__ cu_seqlens_kv, // [B+1] cumulative seqlens
     const int batch,
     const int num_heads_q,
     const int num_heads_kv,
-    const int seqlen_q,
-    const int head_dim_q,
+    const int seqlen_q,                    // always 1 (decode)
+    const int head_dim_q,                  // 128 or 256
     const int head_dim_kv,
     const float softmax_scale)
 {
     // ========================================================================
-    // Constants
-    // ========================================================================
-    constexpr int HEADS_PER_BLOCK  = 16;           // 4x4x4 MFMA: 16 independent blocks
-    constexpr int Q_STRIDE         = 260;          // max head_dim(256) + Q_PAD(4)
-    constexpr int KV_PAD           = 2;            // padding to avoid bank conflicts
-    constexpr int KV_LDS_ELEMS     = 28096;        // (65536 - 8320 - 1024) / 2
-    constexpr int MAX_KV_POSITIONS = 16;           // max seqlen_kv supported in scores
-
-    // ========================================================================
-    // Thread Mapping
-    //
-    // 4x4x4 MFMA has 16 independent 4x4 blocks per wavefront.
-    //   local_head   = lane_id / 4   -> which of the 16 heads this lane works on
-    //   lane_in_head = lane_id % 4   -> position within the 4-lane MFMA block
+    // Block / Thread Mapping
     // ========================================================================
     const int batch_idx    = blockIdx.z;
-    const int head_group   = blockIdx.y;            // which group of 16 heads
-    const int tid          = threadIdx.x;            // [0, 256)
-    const int warp_id      = tid / 64;               // [0, 4)
-    const int lane_id      = tid % 64;               // [0, 64)
-    const int local_head   = lane_id / 4;            // [0, 16) head index within block
-    const int lane_in_head = lane_id % 4;            // [0, 4)  position in MFMA block
-    const int global_head  = head_group * HEADS_PER_BLOCK + local_head;
+    const int head_group   = blockIdx.y;   // which group of 16 heads
+    const int tid          = threadIdx.x;  // [0, 256)
+    const int warp_id      = tid / 64;     // [0, 4)
+    const int lane_id      = tid % 64;     // [0, 64)
+
+    // 4×4×4 MFMA mapping
+    const int block_id      = lane_id / 4;  // [0, 16) → head within group
+    const int lane_in_block = lane_id % 4;  // [0, 4)  → kv_pos or dim
+
+    // Actual head index for this lane
+    const int head_idx = head_group * 16 + block_id;
+
+    // Get actual seqlen_kv and offset for this batch
+    const int seqlen_start = cu_seqlens_kv[batch_idx];
+    const int seqlen_end   = cu_seqlens_kv[batch_idx + 1];
+    const int seqlen_kv    = seqlen_end - seqlen_start;
+
+    const int kv_stride = num_heads_kv * head_dim_kv;
 
     // ========================================================================
-    // Batch / Sequence Info
+    // Pointers — each lane's block_id determines its head
     // ========================================================================
-    const int seqlen_start     = cu_seqlens_kv[batch_idx];
-    const int seqlen_kv        = cu_seqlens_kv[batch_idx + 1] - seqlen_start;
-    const int kv_global_stride = num_heads_kv * head_dim_kv;
+    const bhalf_t* Q_ptr = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
+                             + (size_t)head_idx * seqlen_q * head_dim_q;
 
-    // ========================================================================
-    // Global Memory Pointers
-    // ========================================================================
+    const size_t kv_offset = (size_t)seqlen_start * num_heads_kv * head_dim_kv
+                           + head_idx * head_dim_kv;
+    const bhalf_t* K_ptr = K + kv_offset;
+    const bhalf_t* V_ptr = V + kv_offset;
 
-    // Per-head pointers (for global fallback reads + output writes)
-    const size_t kv_head_offset = (size_t)seqlen_start * kv_global_stride
-                                + global_head * head_dim_kv;
-    const bhalf_t* K_this_head = K + kv_head_offset;
-    const bhalf_t* V_this_head = V + kv_head_offset;
-
-    half_t* O_this_head = O + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
-                            + (size_t)global_head * seqlen_q * head_dim_q;
-
-    // Base pointers for cooperative coalesced loads (all 16 heads of this group)
-    const size_t kv_group_offset = (size_t)seqlen_start * kv_global_stride
-                                 + (size_t)head_group * HEADS_PER_BLOCK * head_dim_kv;
-    const bhalf_t* K_group_base = K + kv_group_offset;
-    const bhalf_t* V_group_base = V + kv_group_offset;
+    half_t* O_ptr = O + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
+                      + (size_t)head_idx * seqlen_q * head_dim_q;
 
     // ========================================================================
     // Shared Memory
+    //
+    // Q_lds: [16 heads][head_dim + 4 pad] — one Q row per head
+    // scores_lds: [16 heads × 16 kv_pos] — QK^T scores + softmax weights
+    //
+    // No KV_lds needed: K and V are read directly from global memory
+    // per-lane (each lane accesses its own head's data, L1-cached).
     // ========================================================================
-    __shared__ __attribute__((aligned(128))) bhalf_t Q_lds[HEADS_PER_BLOCK * Q_STRIDE];
-    __shared__ __attribute__((aligned(128))) float   scores_lds[HEADS_PER_BLOCK * MAX_KV_POSITIONS];
-    __shared__ __attribute__((aligned(128))) bhalf_t KV_lds[KV_LDS_ELEMS];
+    constexpr int MAX_HD     = 256;
+    constexpr int MAX_HD_PAD = MAX_HD + 4;   // 260, bank conflict padding
+    constexpr int MAX_SKV    = 16;
+    constexpr int NUM_HEADS_PER_BLOCK = 16;
 
+    __shared__ __attribute__((aligned(128))) bhalf_t Q_lds[NUM_HEADS_PER_BLOCK * MAX_HD_PAD];
+    __shared__ __attribute__((aligned(128))) float scores_lds[NUM_HEADS_PER_BLOCK * MAX_SKV];
+
+    // Pre-zero scores_lds: 256 floats = 1024 bytes, 1 per thread
     scores_lds[tid] = 0.0f;
 
     // ========================================================================
-    // Runtime KV LDS Layout
-    //
-    // KV_lds is a flat buffer indexed as:
-    //   KV_lds[seq * kv_seq_stride + head * head_dim_padded + dim]
-    //
-    // head_dim_padded = head_dim_q + KV_PAD  (avoids bank conflicts)
-    // kv_seq_stride   = HEADS_PER_BLOCK * head_dim_padded
-    // num_kv_in_lds   = min(seqlen_kv, KV_LDS_ELEMS / kv_seq_stride)
+    // Cooperative load parameters (256 threads, bf16x8 = 8 elements each)
     // ========================================================================
-    const int head_dim_padded = head_dim_q + KV_PAD;
-    const int kv_seq_stride   = HEADS_PER_BLOCK * head_dim_padded;
-    const int max_kv_in_lds   = KV_LDS_ELEMS / kv_seq_stride;
-    const int num_kv_in_lds   = (seqlen_kv < max_kv_in_lds) ? seqlen_kv : max_kv_in_lds;
+    const int epl = 8;                      // elements per bf16x8 load
+    const int tpr = head_dim_q / epl;       // threads per row (16 for D=128, 32 for D=256)
+    const int rpr = BLOCK_SIZE / tpr;       // rows per round (16 for D=128, 8 for D=256)
+    const int my_row = tid / tpr;
+    const int my_col = (tid % tpr) * epl;
 
     // ========================================================================
-    // Cooperative Load Mapping
+    // Phase 0: Load Q → Q_lds (all 16 heads cooperatively)
     //
-    // All 256 threads cooperate to load bf16x8 (16 bytes) chunks.
-    //   D=128: vec_chunks_per_head=16, heads_per_round=16 -> 1 round
-    //   D=256: vec_chunks_per_head=32, heads_per_round=8  -> 2 rounds
+    // Q layout: [B, H_q, S_q, D] — each head has head_dim bf16 values
+    // Q_lds layout: [head][dim+pad]
+    //
+    // 256 threads load 16 heads × head_dim values.
+    // For D=128: 16 rows × 16 bf16x8 = 256 loads = 1 round
+    // For D=256: 16 rows × 32 bf16x8 = 512 loads = 2 rounds
     // ========================================================================
-    const int vec_chunks_per_head = head_dim_q / 8;
-    const int coop_head           = tid / vec_chunks_per_head;
-    const int coop_dim            = (tid % vec_chunks_per_head) * 8;
-    const int heads_per_round     = BLOCK_SIZE / vec_chunks_per_head;
+    ASM_DEBUG_4x4("; Phase 0: Load Q to Q_lds");
+    {
+        const int q_head = my_row;
+        const int q_head_idx = head_group * 16 + q_head;
 
-    // ========================================================================
-    // Phase 0: Cooperative Load  Q -> Q_lds,  K -> KV_lds
-    // ========================================================================
-    ASM_DEBUG_4x4("; Phase 0: Load Q + K to LDS");
-
-    // --- Load Q -> Q_lds ---
-    for (int round = 0; round < HEADS_PER_BLOCK; round += heads_per_round) {
-        const int head = coop_head + round;
-        if (head < HEADS_PER_BLOCK) {
-            const int q_head_idx = head_group * HEADS_PER_BLOCK + head;
-            if (q_head_idx < num_heads_q) {
-                const bhalf_t* Q_src = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
-                                         + (size_t)q_head_idx * seqlen_q * head_dim_q;
-                *(bf16x8*)(&Q_lds[head * Q_STRIDE + coop_dim]) =
-                    *(const bf16x8*)(&Q_src[coop_dim]);
+        if (q_head < NUM_HEADS_PER_BLOCK && q_head_idx < num_heads_q) {
+            const bhalf_t* Q_src = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
+                                     + (size_t)q_head_idx * seqlen_q * head_dim_q;
+            *(bf16x8*)(&Q_lds[q_head * MAX_HD_PAD + my_col]) =
+                *(const bf16x8*)(&Q_src[my_col]);
+        }
+        // For D=256: need second round (rpr=8, only 8 heads per round)
+        if (rpr < NUM_HEADS_PER_BLOCK) {
+            const int q_head_2 = my_row + rpr;
+            const int q_head_idx_2 = head_group * 16 + q_head_2;
+            if (q_head_2 < NUM_HEADS_PER_BLOCK && q_head_idx_2 < num_heads_q) {
+                const bhalf_t* Q_src_2 = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
+                                           + (size_t)q_head_idx_2 * seqlen_q * head_dim_q;
+                *(bf16x8*)(&Q_lds[q_head_2 * MAX_HD_PAD + my_col]) =
+                    *(const bf16x8*)(&Q_src_2[my_col]);
             }
         }
     }
 
-    // --- Load K -> KV_lds (coalesced) ---
-    for (int seq = 0; seq < num_kv_in_lds; seq++) {
-        if (coop_head < HEADS_PER_BLOCK) {
-            *(bf16x8*)(&KV_lds[seq * kv_seq_stride + coop_head * head_dim_padded + coop_dim]) =
-                *(const bf16x8*)(&K_group_base[seq * kv_global_stride + coop_head * head_dim_kv + coop_dim]);
-        }
-        if (heads_per_round < HEADS_PER_BLOCK) {
-            const int head_round2 = coop_head + heads_per_round;
-            if (head_round2 < HEADS_PER_BLOCK) {
-                *(bf16x8*)(&KV_lds[seq * kv_seq_stride + head_round2 * head_dim_padded + coop_dim]) =
-                    *(const bf16x8*)(&K_group_base[seq * kv_global_stride + head_round2 * head_dim_kv + coop_dim]);
-            }
-        }
-    }
-
-    __syncthreads();  // -- Barrier 1: Q + K in LDS --
+    __syncthreads();  // ── Barrier 1: Q in LDS ──
 
     // ========================================================================
-    // Phase 1: QK^T via 4x4x4 MFMA
+    // Phase 1: QK^T via 4×4×4 MFMA
     //
-    //   Each warp handles 4 kv positions: kv_pos = warp_id*4 + lane_in_head
-    //   A operand = Q from Q_lds (broadcast across block)
-    //   B operand = K from KV_lds (LDS path), or global memory (fallback)
+    // Each warp processes a different chunk of kv positions:
+    //   warp 0 → kv [0..3], warp 1 → kv [4..7], etc.
+    //
+    // Within each warp, each 4×4 block handles one head:
+    //   block_id (0-15) → head
+    //   lane_in_block (0-3) → kv position within this warp's chunk
+    //
+    // For each dim tile (4 elements wide):
+    //   A = Q[head, dim_tile]  (broadcast from Q_lds)
+    //   B = K[head, kv_pos, dim_tile] (from global, L1-cached)
+    //   acc += A × B
+    //
+    // K is read directly from global memory per-head. Each lane within
+    // a block reads a different kv position but the SAME head's K data.
+    // The small working set (seqlen_kv ≤ 16 × 4 bf16 per tile) fits in L1.
+    //
+    // After all dim tiles: extract diagonal acc[lane_in_block]
+    // = dot(Q[head], K[kv_pos]) for this lane's kv position.
     // ========================================================================
-    ASM_DEBUG_4x4("; Phase 1: QK^T");
+    ASM_DEBUG_4x4("; Phase 1: QK^T via 4x4x4 MFMA");
 
-    floatx4 mfma_acc = {0};
-    bf16x4 q_operand = {0}, k_operand = {0};
-    const int kv_pos = warp_id * 4 + lane_in_head;
+    floatx4 acc = {0};
+    bf16x4 a_reg = {0}, b_reg = {0};
+
+    const int kv_base = warp_id * 4;  // this warp's starting kv position
+    const int kv_pos_qkt = kv_base + lane_in_block;
 
     #pragma unroll
-    for (int dim_tile = 0; dim_tile < CEIL_DIV(head_dim_q, 4); dim_tile++) {
-        const int dim_offset = dim_tile * 4;
+    for (int dt = 0; dt < CEIL_DIV(head_dim_q, 4); dt++) {
+        const int dim_off = dt * 4;
 
-        q_operand = *(const bf16x4*)(&Q_lds[local_head * Q_STRIDE + dim_offset]);
+        // A operand: Q[head, dim_off..dim_off+3] — BROADCAST within block
+        // All 4 lanes in a block share the same head → same Q values
+        // → LDS broadcast: 1 transaction, 0 bank conflicts
+        a_reg = *(const bf16x4*)(&Q_lds[block_id * MAX_HD_PAD + dim_off]);
 
-        k_operand = {0};
-        if (kv_pos < num_kv_in_lds) {
-            k_operand = *(const bf16x4*)(&KV_lds[kv_pos * kv_seq_stride + local_head * head_dim_padded + dim_offset]);
-        } else if (kv_pos < seqlen_kv) {
-            k_operand = *(const bf16x4*)(&K_this_head[kv_pos * kv_global_stride + dim_offset]);
+        // B operand: K[head, kv_pos, dim_off..dim_off+3] — from global
+        // Each lane reads its own kv position for its own head.
+        b_reg = {0};
+        if (kv_pos_qkt < seqlen_kv) {
+            b_reg = *(const bf16x4*)(&K_ptr[kv_pos_qkt * kv_stride + dim_off]);
         }
 
-        mfma_acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(q_operand, k_operand, mfma_acc, 0, 0, 0);
+        acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_reg, b_reg, acc, 0, 0, 0);
     }
 
-    // Extract diagonal: acc[lane_in_head] = dot(Q[local_head], K[kv_pos])
-    if (kv_pos < MAX_KV_POSITIONS) {
-        scores_lds[local_head * MAX_KV_POSITIONS + kv_pos] = mfma_acc[lane_in_head];
+    // Diagonal extraction: acc[lane_in_block] = dot(Q[head], K[kv_pos])
+    float my_score = acc[lane_in_block];
+
+    // Write to scores_lds[head][kv_pos] for cross-warp visibility
+    if (kv_pos_qkt < MAX_SKV) {
+        scores_lds[block_id * MAX_SKV + kv_pos_qkt] = my_score;
     }
 
-    __syncthreads();  // -- Barrier 2: scores visible, safe to overwrite KV_lds --
+    __syncthreads();  // ── Barrier 2: QK^T scores visible ──
 
     // ========================================================================
-    // Phase 2a: Softmax (warp shuffles within 16-thread sub-groups)
-    //   256 threads -> 16 sub-groups of 16 -> one per head
+    // Phase 2: Softmax (per head, across all kv positions)
     //
-    // Phase 2b: Cooperative Load V -> KV_lds (overwrites K, reuses buffer)
-    //   Runs concurrently with softmax — separate LDS regions, no conflict.
+    // scores_lds[head][0..seqlen_kv-1] contains the raw dot products.
+    //
+    // Thread mapping for softmax:
+    //   tid 0..15   → head 0, each thread handles one kv position
+    //   tid 16..31  → head 1, etc.
+    //   tid 0..255  → all 16 heads covered
+    //
+    // Softmax via warp shuffles within 16-thread sub-groups.
     // ========================================================================
-    ASM_DEBUG_4x4("; Phase 2: Softmax + Load V to LDS");
+    ASM_DEBUG_4x4("; Phase 2: Softmax");
 
-    // --- Softmax ---
-    const int softmax_head = tid / MAX_KV_POSITIONS;
-    const int softmax_kv   = tid % MAX_KV_POSITIONS;
+    const int sm_head = tid / 16;   // [0, 16) → head
+    const int sm_kv   = tid % 16;   // [0, 16) → kv position
+    const int sm_head_idx = head_group * 16 + sm_head;
 
     float raw_score = -INFINITY;
-    if (softmax_kv < seqlen_kv) {
-        raw_score = scores_lds[softmax_head * MAX_KV_POSITIONS + softmax_kv] * softmax_scale;
+    if (sm_kv < seqlen_kv && sm_head_idx < num_heads_q) {
+        raw_score = scores_lds[sm_head * MAX_SKV + sm_kv] * softmax_scale;
     }
 
-    float max_score = raw_score;
+    // Max reduction within 16-thread sub-group
+    float maxVal = raw_score;
     #pragma unroll
-    for (int offset = 8; offset > 0; offset /= 2)
-        max_score = fmaxf(max_score, __shfl_xor(max_score, offset, 16));
-
-    float exp_score = (softmax_kv < seqlen_kv) ? expf(raw_score - max_score) : 0.0f;
-    float sum_exp = exp_score;
-    #pragma unroll
-    for (int offset = 8; offset > 0; offset /= 2)
-        sum_exp += __shfl_xor(sum_exp, offset, 16);
-
-    scores_lds[softmax_head * MAX_KV_POSITIONS + softmax_kv] =
-        (sum_exp > 0.0f) ? (exp_score / sum_exp) : 0.0f;
-
-    // --- Load V -> KV_lds (coalesced, reuses K buffer) ---
-    for (int seq = 0; seq < num_kv_in_lds; seq++) {
-        if (coop_head < HEADS_PER_BLOCK) {
-            *(bf16x8*)(&KV_lds[seq * kv_seq_stride + coop_head * head_dim_padded + coop_dim]) =
-                *(const bf16x8*)(&V_group_base[seq * kv_global_stride + coop_head * head_dim_kv + coop_dim]);
-        }
-        if (heads_per_round < HEADS_PER_BLOCK) {
-            const int head_round2 = coop_head + heads_per_round;
-            if (head_round2 < HEADS_PER_BLOCK) {
-                *(bf16x8*)(&KV_lds[seq * kv_seq_stride + head_round2 * head_dim_padded + coop_dim]) =
-                    *(const bf16x8*)(&V_group_base[seq * kv_global_stride + head_round2 * head_dim_kv + coop_dim]);
-            }
-        }
+    for (int off = 8; off > 0; off /= 2) {
+        maxVal = fmaxf(maxVal, __shfl_xor(maxVal, off, 16));
     }
 
-    __syncthreads();  // -- Barrier 3: softmax weights + V in LDS --
+    // Exp + sum
+    float exp_val = (sm_kv < seqlen_kv && sm_head_idx < num_heads_q) ? expf(raw_score - maxVal) : 0.0f;
+    float sumExp = exp_val;
+    #pragma unroll
+    for (int off = 8; off > 0; off /= 2) {
+        sumExp += __shfl_xor(sumExp, off, 16);
+    }
+
+    // Normalize and store back for Attn×V phase
+    float norm_val = (sumExp > 0.0f) ? (exp_val / sumExp) : 0.0f;
+    scores_lds[sm_head * MAX_SKV + sm_kv] = norm_val;
+
+    __syncthreads();  // ── Barrier 3: softmax done ──
 
     // ========================================================================
-    // Phase 3: Attn x V via 4x4x4 MFMA
+    // Phase 3: Attn×V via 4×4×4 MFMA
     //
-    //   Each warp covers head_dim_q/4 output dimensions.
-    //   A operand = softmax weights from scores_lds
-    //   B operand = V values from KV_lds (LDS path), or global (fallback)
+    // Each warp handles a range of output dimensions:
+    //   warp 0 → dims [0..DW), warp 1 → dims [DW..2*DW), etc.
+    //   where DW = head_dim / 4 (each warp covers head_dim/4 dims)
     //
-    //   Inner loop tiles seqlen_kv by 4 (MFMA K-dimension).
-    //   Outer loop iterates over 4 output dims at a time (MFMA N-dimension).
+    // Within each dim tile (4 elements):
+    //   A = softmax_weights[head, kv_chunk]  (broadcast from scores_lds)
+    //   B = V[head, kv_pos, dim_tile]        (from global, L1-cached)
+    //   acc += A × B
+    //
+    // After all kv_tiles: extract diagonal acc[lane_in_block]
+    //
+    // Output: O[head, dim] = acc[lane_in_block]
     // ========================================================================
-    ASM_DEBUG_4x4("; Phase 3: Attn x V");
+    ASM_DEBUG_4x4("; Phase 3: Attn x V via 4x4x4 MFMA");
 
-    const int dims_per_warp  = head_dim_q / 4;
-    const int warp_dim_start = warp_id * dims_per_warp;
+    // Each warp covers head_dim/4 output dimensions, in chunks of 4
+    const int dims_per_warp = head_dim_q / 4;  // 32 for D=128, 64 for D=256
+    const int dim_start = warp_id * dims_per_warp;
 
-    for (int dim_iter = 0; dim_iter < dims_per_warp; dim_iter += 4) {
-        const int dim_offset = warp_dim_start + dim_iter;
-        mfma_acc = {0};
+    for (int d = 0; d < dims_per_warp; d += 4) {
+        const int dim_off = dim_start + d;
 
+        acc = {0};
+
+        // Iterate over kv positions in chunks of 4
         #pragma unroll
         for (int kv_tile = 0; kv_tile < CEIL_DIV(seqlen_kv, 4); kv_tile++) {
-            const int kv_base = kv_tile * 4;
+            const int kv_start = kv_tile * 4;
 
-            // A operand: softmax attention weights (4 consecutive kv positions)
-            bf16x4 attn_weights = {0};
+            // A operand: softmax weights for this head — BROADCAST within block
+            bf16x4 sw = {0};
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                const int kv_idx = kv_base + i;
-                attn_weights[i] = (kv_idx < seqlen_kv)
-                    ? static_cast<__bf16>(scores_lds[local_head * MAX_KV_POSITIONS + kv_idx])
+                const int kv_idx = kv_start + i;
+                sw[i] = (kv_idx < seqlen_kv)
+                    ? static_cast<__bf16>(scores_lds[block_id * MAX_SKV + kv_idx])
                     : static_cast<__bf16>(0.0f);
             }
 
-            // B operand: V values (4 kv positions, scalar reads)
-            bf16x4 v_operand = {0};
+            // B operand: V[head, kv_pos, dim] — scalar gather from global
+            // We need b_reg[k] = B[k][lane_in_block] = V[kv_start+k, dim_off+lane_in_block]
+            // k varies across register indices (different kv positions),
+            // lane_in_block selects the output dim column.
+            // Cannot use vector load (that would read consecutive dims at ONE kv pos).
+            bf16x4 v_val = {0};
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                const int kv_idx = kv_base + i;
-                if (kv_idx < num_kv_in_lds) {
-                    v_operand[i] = KV_lds[kv_idx * kv_seq_stride + local_head * head_dim_padded
-                                         + dim_offset + lane_in_head];
-                } else if (kv_idx < seqlen_kv) {
-                    v_operand[i] = V_this_head[kv_idx * kv_global_stride
-                                              + dim_offset + lane_in_head];
+                const int kv_idx = kv_start + i;
+                if (kv_idx < seqlen_kv) {
+                    v_val[i] = V_ptr[kv_idx * kv_stride + dim_off + lane_in_block];
                 }
             }
 
-            mfma_acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(attn_weights, v_operand, mfma_acc, 0, 0, 0);
+            acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(sw, v_val, acc, 0, 0, 0);
         }
 
-        const int out_dim = dim_offset + lane_in_head;
+        // Diagonal extraction: acc[lane_in_block] = output for this dim
+        const int out_dim = dim_off + lane_in_block;
         if (out_dim < head_dim_q) {
-            O_this_head[out_dim] = static_cast<half_t>(mfma_acc[lane_in_head]);
+            O_ptr[out_dim] = static_cast<half_t>(acc[lane_in_block]);
         }
     }
 }
