@@ -95,9 +95,6 @@ void fmha_mfma_4x4x4(
     // Actual head index for this lane
     const int head_idx = head_group * 16 + block_id;
 
-    // No early return (would break __syncthreads). Use valid flag instead.
-    const bool head_valid = (head_idx < num_heads_q);
-
     // Get actual seqlen_kv and offset for this batch
     const int seqlen_start = cu_seqlens_kv[batch_idx];
     const int seqlen_end   = cu_seqlens_kv[batch_idx + 1];
@@ -107,15 +104,12 @@ void fmha_mfma_4x4x4(
 
     // ========================================================================
     // Pointers — each lane's block_id determines its head
-    // Guard with head_valid to avoid OOB pointer arithmetic
     // ========================================================================
-    const int safe_head = head_valid ? head_idx : 0;
-
     const bhalf_t* Q_ptr = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
-                             + (size_t)safe_head * seqlen_q * head_dim_q;
+                             + (size_t)head_idx * seqlen_q * head_dim_q;
 
     const size_t kv_offset = (size_t)seqlen_start * num_heads_kv * head_dim_kv
-                           + safe_head * head_dim_kv;
+                           + head_idx * head_dim_kv;
     const bhalf_t* K_ptr = K + kv_offset;
     const bhalf_t* V_ptr = V + kv_offset;
 
