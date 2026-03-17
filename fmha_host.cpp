@@ -62,12 +62,12 @@ public:
         std::mt19937 gen(42);  // Fixed seed for reproducibility
         std::poisson_distribution<int> dist(4);
         for (int i = 0; i < batch; i++) {
-            //int len;
-            //do {
-            //    len = dist(gen);
-            //} while (len < 2 || len > max_seqlen_kv);
-            //seqlens[i] = len;
-            seqlens[i] = 16;
+            int len;
+            do {
+                len = dist(gen);
+            } while (len < 2 || len > max_seqlen_kv);
+            seqlens[i] = len;
+            //seqlens[i] = 16;
         }
         return seqlens;
     }
