@@ -128,13 +128,14 @@ void fmha_mfma_4x4x4(
     constexpr int MAX_HD     = 256;
     constexpr int MAX_HD_PAD = MAX_HD + 4;   // 260, bank conflict padding
     constexpr int MAX_SKV    = 16;
+    constexpr int MAX_SKV_PAD = MAX_SKV + 1; // 17, eliminates 8-way LDS bank conflicts
     constexpr int NUM_HEADS_PER_BLOCK = 16;
 
     __shared__ __attribute__((aligned(128))) bhalf_t Q_lds[NUM_HEADS_PER_BLOCK * MAX_HD_PAD];
-    __shared__ __attribute__((aligned(128))) float scores_lds[NUM_HEADS_PER_BLOCK * MAX_SKV];
+    __shared__ __attribute__((aligned(128))) float scores_lds[NUM_HEADS_PER_BLOCK * MAX_SKV_PAD];
 
-    // Pre-zero scores_lds: 256 floats = 1024 bytes, 1 per thread
-    scores_lds[tid] = 0.0f;
+    // No pre-zero needed: QK^T writes all 256 positions (branchless clamped loads),
+    // softmax masks invalid positions to -INFINITY → exp=0 → weight=0.
 
     // ========================================================================
     // Cooperative load parameters (256 threads, bf16x8 = 8 elements each)
@@ -210,22 +211,18 @@ void fmha_mfma_4x4x4(
 
     const int kv_base = warp_id * 4;  // this warp's starting kv position
     const int kv_pos_qkt = kv_base + lane_in_block;
+    const int safe_kv_bound = max(seqlen_kv - 1, 0);
+
+    // Branchless K load: clamp to valid range instead of EXEC mask branch.
+    // Invalid positions get duplicate scores → masked to -INFINITY by softmax.
+    const int safe_kv_qkt = min(kv_pos_qkt, safe_kv_bound);
 
     #pragma unroll
     for (int dt = 0; dt < CEIL_DIV(head_dim_q, 4); dt++) {
         const int dim_off = dt * 4;
 
-        // A operand: Q[head, dim_off..dim_off+3] — BROADCAST within block
-        // All 4 lanes in a block share the same head → same Q values
-        // → LDS broadcast: 1 transaction, 0 bank conflicts
         a_reg = *(const bf16x4*)(&Q_lds[block_id * MAX_HD_PAD + dim_off]);
-
-        // B operand: K[head, kv_pos, dim_off..dim_off+3] — from global
-        // Each lane reads its own kv position for its own head.
-        b_reg = {0};
-        if (kv_pos_qkt < seqlen_kv) {
-            b_reg = *(const bf16x4*)(&K_ptr[kv_pos_qkt * kv_stride + dim_off]);
-        }
+        b_reg = *(const bf16x4*)(&K_ptr[safe_kv_qkt * kv_stride + dim_off]);
 
         acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_reg, b_reg, acc, 0, 0, 0);
     }
@@ -233,10 +230,8 @@ void fmha_mfma_4x4x4(
     // Diagonal extraction: acc[lane_in_block] = dot(Q[head], K[kv_pos])
     float my_score = acc[lane_in_block];
 
-    // Write to scores_lds[head][kv_pos] for cross-warp visibility
-    if (kv_pos_qkt < MAX_SKV) {
-        scores_lds[block_id * MAX_SKV + kv_pos_qkt] = my_score;
-    }
+    // kv_pos_qkt ∈ [0,15], always < MAX_SKV — no guard needed
+    scores_lds[block_id * MAX_SKV_PAD + kv_pos_qkt] = my_score;
 
     __syncthreads();  // ── Barrier 2: QK^T scores visible ──
 
@@ -258,10 +253,10 @@ void fmha_mfma_4x4x4(
     const int sm_kv   = tid % 16;   // [0, 16) → kv position
     const int sm_head_idx = head_group * 16 + sm_head;
 
-    float raw_score = -INFINITY;
-    if (sm_kv < seqlen_kv && sm_head_idx < num_heads_q) {
-        raw_score = scores_lds[sm_head * MAX_SKV + sm_kv] * softmax_scale;
-    }
+    // Branchless: always read LDS (no EXEC mask), select via v_cndmask
+    const bool sm_valid = (sm_kv < seqlen_kv) & (sm_head_idx < num_heads_q);
+    float loaded_score = scores_lds[sm_head * MAX_SKV_PAD + sm_kv] * softmax_scale;
+    float raw_score = sm_valid ? loaded_score : -INFINITY;
 
     // Max reduction within 16-thread sub-group
     float maxVal = raw_score;
@@ -270,8 +265,8 @@ void fmha_mfma_4x4x4(
         maxVal = fmaxf(maxVal, __shfl_xor(maxVal, off, 16));
     }
 
-    // Exp + sum
-    float exp_val = (sm_kv < seqlen_kv && sm_head_idx < num_heads_q) ? expf(raw_score - maxVal) : 0.0f;
+    // Exp + sum (branchless: invalid has raw_score=-INF, exp(-INF - maxVal)=0)
+    float exp_val = sm_valid ? expf(raw_score - maxVal) : 0.0f;
     float sumExp = exp_val;
     #pragma unroll
     for (int off = 8; off > 0; off /= 2) {
@@ -280,7 +275,7 @@ void fmha_mfma_4x4x4(
 
     // Normalize and store back for Attn×V phase
     float norm_val = (sumExp > 0.0f) ? (exp_val / sumExp) : 0.0f;
-    scores_lds[sm_head * MAX_SKV + sm_kv] = norm_val;
+    scores_lds[sm_head * MAX_SKV_PAD + sm_kv] = norm_val;
 
     __syncthreads();  // ── Barrier 3: softmax done ──
 
@@ -306,6 +301,22 @@ void fmha_mfma_4x4x4(
     const int dims_per_warp = head_dim_q / 4;  // 32 for D=128, 64 for D=256
     const int dim_start = warp_id * dims_per_warp;
 
+    // Preload softmax weights to registers — read once, reuse across all dim iterations.
+    // Max 4 kv_tiles (seqlen_kv ≤ 16, 4 positions per tile).
+    bf16x4 sw_cache[4];
+    #pragma unroll
+    for (int kv_tile = 0; kv_tile < 4; kv_tile++) {
+        const int kv_start = kv_tile * 4;
+        sw_cache[kv_tile] = {0};
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const int kv_idx = kv_start + i;
+            sw_cache[kv_tile][i] = (kv_idx < seqlen_kv)
+                ? static_cast<__bf16>(scores_lds[block_id * MAX_SKV_PAD + kv_idx])
+                : static_cast<__bf16>(0.0f);
+        }
+    }
+
     for (int d = 0; d < dims_per_warp; d += 4) {
         const int dim_off = dim_start + d;
 
@@ -316,31 +327,16 @@ void fmha_mfma_4x4x4(
         for (int kv_tile = 0; kv_tile < CEIL_DIV(seqlen_kv, 4); kv_tile++) {
             const int kv_start = kv_tile * 4;
 
-            // A operand: softmax weights for this head — BROADCAST within block
-            bf16x4 sw = {0};
+            // B operand: V — branchless with clamped index.
+            // sw_cache has 0 for invalid positions → 0 × V[clamped] = 0 in MFMA.
+            bf16x4 v_val;
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                const int kv_idx = kv_start + i;
-                sw[i] = (kv_idx < seqlen_kv)
-                    ? static_cast<__bf16>(scores_lds[block_id * MAX_SKV + kv_idx])
-                    : static_cast<__bf16>(0.0f);
+                const int safe_kv = min(kv_start + i, safe_kv_bound);
+                v_val[i] = V_ptr[safe_kv * kv_stride + dim_off + lane_in_block];
             }
 
-            // B operand: V[head, kv_pos, dim] — scalar gather from global
-            // We need b_reg[k] = B[k][lane_in_block] = V[kv_start+k, dim_off+lane_in_block]
-            // k varies across register indices (different kv positions),
-            // lane_in_block selects the output dim column.
-            // Cannot use vector load (that would read consecutive dims at ONE kv pos).
-            bf16x4 v_val = {0};
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                const int kv_idx = kv_start + i;
-                if (kv_idx < seqlen_kv) {
-                    v_val[i] = V_ptr[kv_idx * kv_stride + dim_off + lane_in_block];
-                }
-            }
-
-            acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(sw, v_val, acc, 0, 0, 0);
+            acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(sw_cache[kv_tile], v_val, acc, 0, 0, 0);
         }
 
         // Diagonal extraction: acc[lane_in_block] = output for this dim
