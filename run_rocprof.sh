@@ -1,0 +1,13 @@
+docker run                               \
+       -it --privileged                  \
+       -w /workspace                          \
+       -v ${HOME}/workspace:/workspace             \
+       -v ${HOME}/.ssh:/root/.ssh        \
+       --device=/dev/kfd                 \
+       --device=/dev/dri                 \
+       --ipc=host                        \
+       --shm-size 16G                    \
+       --group-add video                 \
+       --cap-add=SYS_PTRACE              \
+       --security-opt seccomp=unconfined \
+	--net=host rocm7.1 bash
