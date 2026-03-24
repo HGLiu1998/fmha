@@ -14,10 +14,8 @@
 #include <chrono>
 #include <fstream>
 #include "fmha_mfma_kernel.hpp"
-#include "fmha_mfma_coalesced_kernel.hpp"
-#include "fmha_mfma_allwarp_kernel.hpp"
+#include "fmha_vectorized_fma_kernel.hpp"
 #include "fmha_mfma_4x4x4_kernel.hpp"
-#include "fmha_mfma_4x4x4_pipelined_kernel.hpp"
 
 // Type aliases for numeric types
 using bhalf_t = __bf16;      // bfloat16 for Q, K, V
@@ -356,8 +354,8 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     HIP_CHECK(hipMemcpy(d_cu_seqlens_kv, h_cu_seqlens_kv, (config.batch + 1) * sizeof(int), hipMemcpyHostToDevice));
 
     // Configure kernel launch parameters
-    // Grid: (1, num_heads_q, batch) - One block per head per batch element
-    dim3 gridDim(1, config.num_heads_q, config.batch);
+    // Grid: (1, CEIL_DIV(num_heads_q, 16), batch) - 16 heads per block via 16 MFMA blocks
+    dim3 gridDim(1, CEIL_DIV(config.num_heads_q, 16), config.batch);
     dim3 blockDim(256, 1, 1);
 
     // Create HIP events for timing
@@ -366,7 +364,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     // Warm-up phase: stabilize GPU clocks and caches
     std::cout << "Running " << warm_ups << " warm-up iterations...\n";
     for (int i = 0; i < warm_ups; ++i) {
-        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
+        fmha_mfma_4x4x4<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
                            config.seqlen_q, config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
@@ -380,7 +378,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     
     HIP_CHECK(hipEventRecord(start, NULL));
     for (int i = 0; i < num_iterations; i++) {
-        fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
+        fmha_mfma_4x4x4<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
                            config.batch, config.num_heads_q, config.num_heads_kv,
                            config.seqlen_q, config.head_dim_q, config.head_dim_kv,
                            1.0f / sqrt(config.head_dim_q));
@@ -434,7 +432,7 @@ void run_fmha_benchmark(const FMHAConfig& config, int num_iterations = 20, int w
     // Verify correctness: run one more iteration and check output
     std::cout << "\n=== Validation ===\n";
     HIP_CHECK(hipMemset(d_O, 0, config.o_size() * sizeof(half_t)));
-    fmha_mfma<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
+    fmha_mfma_4x4x4<<<gridDim, blockDim>>>(d_Q, d_K, d_V, d_O, d_cu_seqlens_kv,
         config.batch, config.num_heads_q, config.num_heads_kv,
         config.seqlen_q, config.head_dim_q, config.head_dim_kv,
         1.0f / sqrt(config.head_dim_q));
