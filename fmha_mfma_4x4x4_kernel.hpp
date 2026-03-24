@@ -21,49 +21,29 @@ using floatx4 = float __attribute__((ext_vector_type(4)));
 #endif
 
 // ============================================================================
-// MFMA 4x4x4 FMHA Decode Kernel
+// MFMA 4x4x4 FMHA Decode Kernel — LDS-Staged Cooperative Loading
 //
 // Uses __builtin_amdgcn_mfma_f32_4x4x4bf16_1k (v_mfma_f32_4x4x4_16b_bf16)
 //
 // MFMA 4x4x4 with 16 blocks:
 //   C[4 × 4]  +=  A[4 × 4]  ×  B[4 × 4]
-//   M=4(seq)   N=4(dim/kv)   K=4(reduction)
 //   16 blocks = 16 heads (independent)
 //
 // Thread layout:
 //   block_id     = lane_id / 4  → head [0, 16)
 //   tid_in_block = lane_id % 4  → N dimension worker [0, 4)
 //
-//   Thread t provides:  A[t, 0..3] (row t)  and  B[0..3, t] (col t)
-//   Thread t receives:  C[0..3, t] (col t)
-//
-// For decode (seqlen_q = 1):
-//   M=4 but only row 0 is populated (seqlen_q=1, rows 1-3 = 0)
-//   C[0, t] = useful result for all t
-//
-// QK^T phase:  C[4(seq) × 4(kv)] += A[4(seq) × 4(dim_k)] × B[4(dim_k) × 4(kv)]
-//   A[0,:] = Q[k:k+4]             (tid_in_block==0 only, rows 1-3 = 0)
-//   B[:,t] = K[kv_group+t, k:k+4] (each thread handles one kv position)
-//   C[0,t] = Q · K[kv_group+t]    → score for kv position kv_group+t
-//   Iterate: 4 kv_groups × head_dim/4 k-tiles
-//
-// V phase:    C[4(seq) × 4(dim)] += A[4(seq) × 4(kv_k)] × B[4(kv_k) × 4(dim)]
-//   A[0,:] = weights[kv_base:kv_base+4]  (tid_in_block==0 only)
-//   B[:,t] = V[kv_base+0..3, dim+t]      (each thread handles one dim)
-//   C[0,t] = Σ_kv w[kv] × V[kv, dim+t]  → output for dim+t
-//   Iterate: head_dim/4 dim_groups × seqlen_kv/4 kv_chunks
-//
-// Warp usage:
-//   4 warps all compute the same 16 heads (QK^T redundant, L2-cached)
-//   V phase: each warp writes head_dim/4 output dims (no overlap)
+// LDS Layout:
+//   Q_lds:  [16 heads × hd_pad]                  — loaded once
+//   KV_lds: [4 kv_positions × 16 heads × hd_pad] — reloaded per kv_group
+//   hd_pad = head_dim + 4 (bank conflict padding)
 //
 // Grid: (1, CEIL_DIV(num_heads_q, 16), batch)
-// Shared memory: 0 bytes
-// Barriers: 0
+// Block: 256 threads (4 warps)
 // ============================================================================
 
 __global__
-__launch_bounds__(256, 2)
+__launch_bounds__(256, 1)
 void fmha_mfma_4x4x4(
     const bhalf_t* __restrict__ Q,         // [B, H_q,  S_q,  D] bf16
     const bhalf_t* __restrict__ K,         // Packed: [1, total_S_kv, H_kv, D]
@@ -80,21 +60,17 @@ void fmha_mfma_4x4x4(
 {
     // ========================================================================
     // Thread Mapping
-    //
-    // block_id     = lane_id / 4   → head [0, 16)
-    // tid_in_block = lane_id % 4   → N-dimension worker [0, 4)
-    //   QK^T: t → kv position within group
-    //   V:    t → dim position within group
     // ========================================================================
     const int batch_idx    = blockIdx.z;
-    const int head_group   = blockIdx.y;      // which group of 16 heads
+    const int head_group   = blockIdx.y;
     const int tid          = threadIdx.x;     // [0, 256)
     const int warp_id      = tid / 64;        // [0, 4)
     const int lane_id      = tid % 64;        // [0, 64)
-    const int block_id     = lane_id / 4;     // [0, 16) = head
+    const int block_id     = lane_id / 4;     // [0, 16) = head within group
     const int tid_in_block = lane_id % 4;     // [0, 4)  = N-dim worker
 
-    const int head_idx = head_group * 16 + block_id;
+    const int head_base = head_group * 16;
+    const int head_idx  = head_base + block_id;
     if (head_idx >= num_heads_q) return;
 
     // Batch-specific KV info
@@ -103,67 +79,132 @@ void fmha_mfma_4x4x4(
     const int seqlen_kv    = seqlen_end - seqlen_start;
     const int kv_stride    = num_heads_kv * head_dim_kv;
 
-    // Per-head pointers
-    const bhalf_t* Q_ptr = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
-                             + (size_t)head_idx * seqlen_q * head_dim_q;
-    const bhalf_t* K_base = K + (size_t)seqlen_start * kv_stride
-                              + (size_t)head_idx * head_dim_kv;
-    const bhalf_t* V_base = V + (size_t)seqlen_start * kv_stride
-                              + (size_t)head_idx * head_dim_kv;
+    const int hd_pad = head_dim_q + 4;
+
+    // ========================================================================
+    // LDS Allocation
+    // Q_lds:  16 heads × hd_pad
+    // KV_lds: 4 kv_pos × 16 heads × hd_pad
+    // ========================================================================
+    constexpr int max_hd_pad = 256 + 4;
+    __shared__ __attribute__((aligned(128))) bhalf_t Q_lds[16 * max_hd_pad];
+    __shared__ __attribute__((aligned(128))) bhalf_t KV_lds[4 * 16 * max_hd_pad];
+
+    // Pointers
+    const bhalf_t* Q_batch = Q + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q;
     half_t* O_ptr = O + (size_t)batch_idx * num_heads_q * seqlen_q * head_dim_q
                       + (size_t)head_idx * seqlen_q * head_dim_q;
+    const bhalf_t* K_batch = K + (size_t)seqlen_start * kv_stride;
+    const bhalf_t* V_batch = V + (size_t)seqlen_start * kv_stride;
 
     // ========================================================================
-    // Phase 1: QK^T
-    //
-    // C[4(seq) × 4(kv)] += A[4(seq) × 4(dim_k)] × B[4(dim_k) × 4(kv)]
-    //
-    //   A[0, i] = Q[k+i]            (row 0 = query, rows 1-3 = 0)
-    //   B[i, t] = K[kv_group+t, k+i] (col t = one kv position)
-    //   C[0, t] = score[kv_group+t]
-    //
-    // tid_in_block → kv position within kv_group (N dimension)
-    // Iterate: 4 kv_groups × head_dim/4 k-tiles
-    // Gather 4 scores per kv_group via __shfl(width=4)
+    // Phase 1: Load Q → Q_lds (cooperative, all 256 threads)
     // ========================================================================
-    float scores[16];
+    {
+        const int total_q_vals = 16 * head_dim_q;
+        const int vals_per_round = 256 * 8;
 
-    #pragma unroll
-    for (int kv_group = 0; kv_group < 16; kv_group += 4) {
-        floatx4 acc = {0, 0, 0, 0};
-        const int kv_pos = kv_group + tid_in_block;
-        const bool kv_valid = (kv_pos < seqlen_kv);
+        for (int round_start = 0; round_start < total_q_vals; round_start += vals_per_round) {
+            const int val_idx = round_start + tid * 8;
+            if (val_idx < total_q_vals) {
+                const int head_local = val_idx / head_dim_q;
+                const int dim_offset = val_idx % head_dim_q;
+                const int actual_head = head_base + head_local;
 
-        for (int k = 0; k < head_dim_q; k += 4) {
-            bf16x4 a_val, b_val;
-
-            // A: row 0 = Q, rows 1-3 = 0 (seqlen_q = 1)
-            if (tid_in_block == 0) {
-                a_val = *(const bf16x4*)(&Q_ptr[k]);
-            } else {
-                a_val = bf16x4{0, 0, 0, 0};
+                bf16x8 q_data;
+                if (actual_head < num_heads_q) {
+                    q_data = *(const bf16x8*)(&Q_batch[actual_head * head_dim_q + dim_offset]);
+                } else {
+                    q_data = bf16x8{0, 0, 0, 0, 0, 0, 0, 0};
+                }
+                *(bf16x8*)(&Q_lds[head_local * hd_pad + dim_offset]) = q_data;
             }
-
-            // B: col t = K at kv position kv_group + t
-            if (kv_valid) {
-                b_val = *(const bf16x4*)(&K_base[kv_pos * kv_stride + k]);
-            } else {
-                b_val = bf16x4{0, 0, 0, 0};
-            }
-
-            acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_val, b_val, acc, 0, 0, 0);
-        }
-
-        // C[0, t] = score for kv_group + t
-        // Gather within 4-thread sub-group: all threads get all 4 scores
-        #pragma unroll
-        for (int s = 0; s < 4; s++) {
-            scores[kv_group + s] = __shfl(acc[0], s, 4);
         }
     }
 
     // ========================================================================
-    // Phase 2: Softmax (serial in registers, no LDS, no barrier)
+    // Phase 2: QK^T — process 4 kv positions at a time
+    // ========================================================================
+    float scores[16];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) scores[i] = 0.0f;
+
+    const int num_kv_groups = CEIL_DIV(seqlen_kv, 4);
+
+    for (int g = 0; g < num_kv_groups; g++) {
+        const int kv_group = g * 4;
+        const int n_valid = min(4, seqlen_kv - kv_group);
+
+        // --- Cooperative load K → KV_lds ---
+        {
+            const int vals_per_kv = 16 * head_dim_q;
+            const int vals_per_round = 256 * 8;
+
+            const int total_valid_vals = n_valid * vals_per_kv;
+            for (int round_start = 0; round_start < total_valid_vals; round_start += vals_per_round) {
+                const int val_idx = round_start + tid * 8;
+                if (val_idx < total_valid_vals) {
+                    const int kv_local   = val_idx / vals_per_kv;
+                    const int within_kv  = val_idx % vals_per_kv;
+                    const int head_local = within_kv / head_dim_q;
+                    const int dim_offset = within_kv % head_dim_q;
+
+                    const bhalf_t* src = K_batch
+                        + (size_t)(kv_group + kv_local) * kv_stride
+                        + (size_t)(head_base + head_local) * head_dim_kv
+                        + dim_offset;
+                    *(bf16x8*)(&KV_lds[kv_local * 16 * hd_pad + head_local * hd_pad + dim_offset])
+                        = *(const bf16x8*)(src);
+                }
+            }
+
+            if (n_valid < 4) {
+                const int zero_vals = (4 - n_valid) * vals_per_kv;
+                for (int round_start = 0; round_start < zero_vals; round_start += vals_per_round) {
+                    const int val_idx = round_start + tid * 8;
+                    if (val_idx < zero_vals) {
+                        const int kv_local   = n_valid + val_idx / vals_per_kv;
+                        const int within_kv  = val_idx % vals_per_kv;
+                        const int head_local = within_kv / head_dim_q;
+                        const int dim_offset = within_kv % head_dim_q;
+                        *(bf16x8*)(&KV_lds[kv_local * 16 * hd_pad + head_local * hd_pad + dim_offset])
+                            = bf16x8{0, 0, 0, 0, 0, 0, 0, 0};
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // --- MFMA loop: Q_lds × K_lds^T ---
+        {
+            floatx4 acc = {0, 0, 0, 0};
+
+            for (int k = 0; k < head_dim_q; k += 4) {
+                bf16x4 a_val, b_val;
+
+                if (tid_in_block == 0) {
+                    a_val = *(const bf16x4*)(&Q_lds[block_id * hd_pad + k]);
+                } else {
+                    a_val = bf16x4{0, 0, 0, 0};
+                }
+
+                b_val = *(const bf16x4*)(&KV_lds[tid_in_block * 16 * hd_pad + block_id * hd_pad + k]);
+
+                acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_val, b_val, acc, 0, 0, 0);
+            }
+
+            #pragma unroll
+            for (int s = 0; s < 4; s++) {
+                scores[kv_group + s] = __shfl(acc[0], s, 4);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // ========================================================================
+    // Phase 3: Softmax (registers, no LDS, no barrier)
     // ========================================================================
     float weights[16];
     {
@@ -193,38 +234,78 @@ void fmha_mfma_4x4x4(
     }
 
     // ========================================================================
-    // Phase 3: Attn × V
+    // Phase 4: Attn × V
     //
-    // C[4(seq) × 4(dim)] += A[4(seq) × 4(kv_k)] × B[4(kv_k) × 4(dim)]
-    //
-    //   A[0, i] = weights[kv_base+i]          (row 0 = weights, rows 1-3 = 0)
-    //   B[i, t] = V[kv_base+i, dim_group+t]   (col t = one dim position)
-    //   C[0, t] = output[dim_group+t]
-    //
-    // block_id = head (same as QK^T, each block is one head)
-    // tid_in_block → dim position within 4-dim group (N dimension)
-    // All 16 blocks (heads) process the SAME dim_group simultaneously,
-    // each with its own head's weights and V data.
-    //
-    // Each warp handles head_dim/4 dims to avoid redundant writes.
+    // Each warp handles head_dim/4 output dims.
+    // v_acc[i] accumulates C[0,t] for dim_group i across all kv_chunks.
+    // Max accumulators: D=128 → 32/4=8, D=256 → 64/4=16
     // ========================================================================
     const int dims_per_warp = head_dim_q / 4;
     const int warp_dim_start = warp_id * dims_per_warp;
+    const int num_dim_groups = dims_per_warp / 4;  // 8 (D=128) or 16 (D=256)
 
-    for (int dg = 0; dg < dims_per_warp; dg += 4) {
-        const int dim_group = warp_dim_start + dg;
-        const int out_d     = dim_group + tid_in_block;
+    float v_acc[16];  // max 16 for D=256
+    for (int i = 0; i < num_dim_groups; i++) v_acc[i] = 0.0f;
 
-        floatx4 out_acc = {0, 0, 0, 0};
+    const int num_kv_chunks = CEIL_DIV(seqlen_kv, 4);
 
-        for (int kv_base = 0; kv_base < seqlen_kv; kv_base += 4) {
+    for (int c = 0; c < num_kv_chunks; c++) {
+        const int kv_chunk = c * 4;
+        const int n_valid = min(4, seqlen_kv - kv_chunk);
+
+        // --- Cooperative load V → KV_lds ---
+        {
+            const int vals_per_kv = 16 * head_dim_q;
+            const int vals_per_round = 256 * 8;
+
+            const int total_valid_vals = n_valid * vals_per_kv;
+            for (int round_start = 0; round_start < total_valid_vals; round_start += vals_per_round) {
+                const int val_idx = round_start + tid * 8;
+                if (val_idx < total_valid_vals) {
+                    const int kv_local   = val_idx / vals_per_kv;
+                    const int within_kv  = val_idx % vals_per_kv;
+                    const int head_local = within_kv / head_dim_q;
+                    const int dim_offset = within_kv % head_dim_q;
+
+                    const bhalf_t* src = V_batch
+                        + (size_t)(kv_chunk + kv_local) * kv_stride
+                        + (size_t)(head_base + head_local) * head_dim_kv
+                        + dim_offset;
+                    *(bf16x8*)(&KV_lds[kv_local * 16 * hd_pad + head_local * hd_pad + dim_offset])
+                        = *(const bf16x8*)(src);
+                }
+            }
+
+            if (n_valid < 4) {
+                const int zero_vals = (4 - n_valid) * vals_per_kv;
+                for (int round_start = 0; round_start < zero_vals; round_start += vals_per_round) {
+                    const int val_idx = round_start + tid * 8;
+                    if (val_idx < zero_vals) {
+                        const int kv_local   = n_valid + val_idx / vals_per_kv;
+                        const int within_kv  = val_idx % vals_per_kv;
+                        const int head_local = within_kv / head_dim_q;
+                        const int dim_offset = within_kv % head_dim_q;
+                        *(bf16x8*)(&KV_lds[kv_local * 16 * hd_pad + head_local * hd_pad + dim_offset])
+                            = bf16x8{0, 0, 0, 0, 0, 0, 0, 0};
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // --- MFMA: weights × V ---
+        for (int dg_idx = 0; dg_idx < num_dim_groups; dg_idx++) {
+            const int dg = dg_idx * 4;
+            const int dim_group = warp_dim_start + dg;
+            const int out_d     = dim_group + tid_in_block;
+
             bf16x4 a_val, b_val;
 
-            // A: row 0 = softmax weights for this kv chunk
             if (tid_in_block == 0) {
                 #pragma unroll
                 for (int i = 0; i < 4; i++) {
-                    int kv = kv_base + i;
+                    int kv = kv_chunk + i;
                     a_val[i] = (kv < seqlen_kv)
                         ? static_cast<bhalf_t>(weights[kv])
                         : static_cast<bhalf_t>(0.0f);
@@ -233,21 +314,26 @@ void fmha_mfma_4x4x4(
                 a_val = bf16x4{0, 0, 0, 0};
             }
 
-            // B: col t = V values at dim out_d across kv positions
             #pragma unroll
             for (int i = 0; i < 4; i++) {
-                int kv = kv_base + i;
-                if (kv < seqlen_kv) {
-                    b_val[i] = V_base[kv * kv_stride + out_d];
-                } else {
-                    b_val[i] = static_cast<bhalf_t>(0.0f);
-                }
+                b_val[i] = KV_lds[i * 16 * hd_pad + block_id * hd_pad + out_d];
             }
 
-            out_acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_val, b_val, out_acc, 0, 0, 0);
+            floatx4 mfma_acc = {v_acc[dg_idx], 0, 0, 0};
+            mfma_acc = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(a_val, b_val, mfma_acc, 0, 0, 0);
+            v_acc[dg_idx] = mfma_acc[0];
         }
 
-        // C[0, t] = output[dim_group + t]
-        O_ptr[out_d] = static_cast<half_t>(out_acc[0]);
+        __syncthreads();
+    }
+
+    // ========================================================================
+    // Phase 5: Write output
+    // ========================================================================
+    for (int dg_idx = 0; dg_idx < num_dim_groups; dg_idx++) {
+        const int dg = dg_idx * 4;
+        const int dim_group = warp_dim_start + dg;
+        const int out_d     = dim_group + tid_in_block;
+        O_ptr[out_d] = static_cast<half_t>(v_acc[dg_idx]);
     }
 }
